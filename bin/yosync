@@ -1,0 +1,1324 @@
+#!/usr/bin/env python3
+import argparse
+import collections
+import datetime
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+for _p in ("/opt/homebrew/bin", "/usr/local/bin"):
+    if _p not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _p + ":" + os.environ.get("PATH", "")
+
+HOME = os.path.expanduser("~")
+DEFAULT_DEST = os.path.join(HOME, "Movies", "OfflineYouTube")
+CONFIG_DIR = os.path.join(HOME, ".config", "yosync")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+PLIST_NAME = "com.vyom.yosync.plist"
+PLIST_PATH = os.path.join(HOME, "Library", "LaunchAgents", PLIST_NAME)
+
+FMT = 'bv*[height<=1440][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=1440]+ba/b[height<=1440]'
+
+STOPWORDS = {
+    "the", "and", "for", "are", "was", "with", "this", "that", "have", "from",
+    "your", "you", "all", "can", "not", "but", "his", "her", "what", "why",
+    "when", "where", "how", "who", "will", "just", "they", "them", "then",
+    "than", "there", "here", "about", "which", "their", "these", "those",
+    "into", "over", "under", "after", "before", "while", "because", "watching",
+    "video", "official", "official", "watch", "episode", "youtu", "www", "new",
+}
+
+KEYWORD_MIN_LEN = 4
+KEYWORD_TOPN = 15
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def parse_dt(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        stamp = float(raw)
+        if stamp > 10_000_000_000:
+            stamp /= 1000.0
+        return datetime.datetime.fromtimestamp(stamp, tz=datetime.timezone.utc)
+    s = str(raw).strip()
+    if s.isdigit():
+        return parse_dt(int(s))
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    if s.endswith("Z") or s.endswith("z"):
+        base = s[:-1]
+        if re.search(r"[+-]\d\d:\d\d$", base):
+            candidate = base
+        else:
+            candidate = base + "+00:00"
+        try:
+            return datetime.datetime.fromisoformat(candidate)
+        except ValueError:
+            pass
+    return None
+
+
+def extract_video_id(url):
+    if not url:
+        return None
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"/shorts/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"/embed/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def clean_title(raw):
+    if not raw:
+        return None
+    t = raw
+    for prefix in ("Watched ", "Watched a video ", "Watched a TV episode ",
+                   "Watched a movie ", "Watched a "):
+        if t.startswith(prefix):
+            t = t[len(prefix):]
+            break
+    t = t.split(" - ")[0]
+    t = t.strip()
+    return t or None
+
+
+def channel_url_ok(url):
+    if not url:
+        return None
+    if "/channel/UC" in url:
+        return url
+    m = re.search(r"youtube\.com/(@[A-Za-z0-9._-]+)", url)
+    if m:
+        return "https://www.youtube.com/" + m.group(1)
+    return None
+
+
+def log(msg, silent=False, logfile=None):
+    line = "[%s] %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    if not silent:
+        print(line, flush=True)
+    if logfile:
+        try:
+            with open(logfile, "a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+
+def acquire_lock():
+    lock_dir = os.path.expanduser("~/.config/yosync")
+    fd = None
+    try:
+        os.makedirs(lock_dir, exist_ok=True)
+        fd = open(os.path.join(lock_dir, ".lock"), "w")
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        pass
+    return fd
+
+
+def default_config(dest):
+    return {
+        "dest": dest,
+        "hot_weeks": 2,
+        "hot_min_watches": 4,
+        "cold_days": 14,
+        "channel_budget_gb": 2,
+        "budget_per_video": 0.17,
+        "budget_min_gb": 1.0,
+        "budget_max_gb": 3.5,
+        "budget_tiers": [
+            {"min_watches": 4, "gb": 1.0},
+            {"min_watches": 5, "gb": 1.5},
+            {"min_watches": 10, "gb": 2.0},
+            {"min_watches": 15, "gb": 2.5},
+            {"min_watches": 20, "gb": 3.5},
+        ],
+        "quickfill_workers": 8,
+        "quickfill_fragments": 16,
+        "quickfill_recent": 100,
+        "quickfill_margin": 0.95,
+        "quickfill_aria2c": True,
+        "quickfill_enrich_workers": 12,
+        "quickfill_cookies": "chrome",
+        "recent_uploads": 30,
+        "max_height": 1440,
+        "keyword_min_len": KEYWORD_MIN_LEN,
+        "keyword_topn": KEYWORD_TOPN,
+        "drive_remote": "gd",
+        "drive_path": "Takeout",
+        "enrich_limit": 150,
+        "daemon": False,
+        "exclude_channels": [],
+        "ad_channel_names": [],
+        "ad_keywords": [],
+    }
+
+
+def load_config(silent=False):
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    try:
+        with open(CONFIG_PATH) as fh:
+            cfg = json.load(fh)
+        cfg["dest"] = os.path.expanduser(cfg["dest"])
+        return cfg
+    except (OSError, ValueError):
+        log("config unreadable; run setup again", silent)
+        return None
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+
+
+def paths_in_dest(dest):
+    state_dir = os.path.join(dest, ".yosync")
+    return {
+        "inbox": os.path.join(dest, "inbox"),
+        "incoming": os.path.join(state_dir, "incoming"),
+        "state_dir": state_dir,
+        "state": os.path.join(state_dir, "state.json"),
+        "archive": os.path.join(state_dir, "dl-archive.txt"),
+        "consumed": os.path.join(state_dir, "takeout"),
+        "logfile": os.path.join(dest, "logs", "sync.log"),
+    }
+
+
+def ensure_dirs(cfg):
+    p = paths_in_dest(cfg["dest"])
+    for d in (cfg["dest"], p["inbox"], p["incoming"], p["state_dir"],
+              p["consumed"], os.path.dirname(p["logfile"])):
+        os.makedirs(d, exist_ok=True)
+
+
+def ingest_files(cfg, state, silent=False):
+    p = paths_in_dest(cfg["dest"])
+    processed = set(state.get("processed") or [])
+    got = []
+    now = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    for base in (p["inbox"], p["incoming"]):
+        if not os.path.isdir(base):
+            continue
+        for root, _dirs, names in os.walk(base):
+            for name in sorted(names):
+                if not (name.endswith(".zip") or name.endswith(".json")):
+                    continue
+                src = os.path.join(root, name)
+                key = os.path.basename(src)
+                if key in processed:
+                    continue
+                processed.add(key)
+                if os.path.dirname(src) == os.path.dirname(p["inbox"]):
+                    dst = os.path.join(p["consumed"], "%s-%s" % (now, key))
+                    shutil.move(src, dst)
+                    src = dst
+                got.append(src)
+    if got:
+        state["processed"] = sorted(processed)
+        if not silent:
+            log("picked up %d takeout export(s)" % len(got))
+    return got
+
+
+def rclone_pull(cfg, silent=False):
+    rclone = shutil.which("rclone")
+    if not rclone:
+        log("rclone not found; install with: brew install rclone", silent)
+        return False
+    remote = cfg.get("drive_remote") or "gd"
+    path = cfg.get("drive_path") or "Takeout"
+    incoming = paths_in_dest(cfg["dest"])["incoming"]
+    cmd = [rclone, "copy", "%s:%s" % (remote, path), incoming,
+           "--include", "*.zip", "--include", "watch-history.json",
+           "--ignore-existing", "--transfers", "1"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        log("rclone error: %s" % (r.stderr.strip() or "unknown"),
+            silent)
+        return False
+    return True
+
+
+def load_watch_history(path, silent=False, ads=None):
+    log("parsing %s" % os.path.basename(path), silent)
+    if path.endswith(".zip"):
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            j = [n for n in names if n.endswith("watch-history.json")]
+            h = [n for n in names if n.endswith("watch-history.html")]
+            if not j and not h:
+                raise ValueError("no watch-history file inside archive")
+            for n in j:
+                with zf.open(n) as fh:
+                    data = json.load(fh)
+                return records_from_json(data, ads=ads)
+            with zf.open(h[0]) as fh:
+                text = fh.read().decode("utf-8", errors="replace")
+            return records_from_html(text, ads=ads)
+    if path.endswith(".html"):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return records_from_html(fh.read(), ads=ads)
+    with open(path) as fh:
+        data = json.load(fh)
+    return records_from_json(data, ads=ads)
+
+
+def _ad_identifiers(e):
+    out = {}
+    for d in (e.get("subtitles") or []):
+        n = (d.get("name") or "").strip()
+        if n:
+            out[n.lower()] = n
+        u = d.get("url")
+        if u and channel_url_ok(u):
+            out[u.lower()] = u
+    cid = e.get("channelId")
+    if cid:
+        u = "https://www.youtube.com/channel/" + cid
+        out[u.lower()] = u
+    m = re.match(r"^https?://([^/]+)", (e.get("titleUrl") or "").strip())
+    if m and "youtube" not in m.group(1).lower():
+        out[m.group(1).lower().rstrip("/")] = m.group(1)
+    return out
+
+
+def records_from_json(entries, ads=None):
+    records = []
+    for e in entries:
+        if any((d or {}).get("name") == "From Google Ads"
+               for d in (e.get("details") or [])):
+            if ads is not None:
+                ads.update(_ad_identifiers(e))
+            continue
+        rid = extract_video_id(e.get("titleUrl"))
+        if not rid:
+            rid = extract_video_id(e.get("title"))
+        m = re.match(r"^https?://([^/]+)", (e.get("titleUrl") or "").strip())
+        if m and "youtube" not in m.group(1).lower():
+            if ads is not None:
+                ads[m.group(1).lower().rstrip("/")] = m.group(1)
+            continue
+        when = parse_dt(e.get("time"))
+        if not rid or not when:
+            continue
+        when = when.replace(microsecond=0)
+        subs = e.get("subtitles") or []
+        ch_name = None
+        ch_url = None
+        if subs:
+            ch_name = subs[0].get("name")
+            ch_url = channel_url_ok(subs[0].get("url"))
+        if e.get("channelId"):
+            ch_url = ch_url or ("https://www.youtube.com/channel/" + e["channelId"])
+        title = clean_title(e.get("title"))
+        if title and title.startswith("http"):
+            title = None
+        records.append({
+            "id": rid,
+            "title": title,
+            "time": when.isoformat(),
+            "channel": ch_name,
+            "channel_url": ch_url,
+        })
+    return records
+
+
+def records_from_html(text, ads=None):
+    records = []
+    pat = re.compile(
+        r"Watched\shttps?://(?:www\.)?youtube\.com/(?:watch\?v=|shorts/)"
+        r"([A-Za-z0-9_-]{11}).*?"
+        r"([A-Z][a-z]{2}\s\d{1,2},\s\d{4},\s\d{1,2}:\d{2}:\d{2}\s[AP]M)")
+    for m in pat.finditer(text):
+        tstr = m.group(2).replace("\u202f", " ").replace("\xa0", " ")
+        try:
+            when = datetime.datetime.strptime(tstr, "%b %d, %Y, %I:%M:%S %p")
+        except ValueError:
+            continue
+        when = when.astimezone().astimezone(datetime.timezone.utc)
+        records.append({
+            "id": m.group(1),
+            "title": None,
+            "time": when.isoformat(),
+            "channel": None,
+            "channel_url": None,
+        })
+    return records
+
+
+def merge_history(state, records):
+    seen = {(r["id"], r["time"]) for r in state.get("history", [])}
+    added = 0
+    for r in records:
+        key = (r["id"], r["time"])
+        if key in seen:
+            continue
+        seen.add(key)
+        state.setdefault("history", []).append(r)
+        added += 1
+    return added
+
+
+def channel_key(rec):
+    return rec.get("channel_url") or rec.get("channel") or rec.get("id")
+
+
+def ytdlp_meta(vid, sleep=0.5, timeout=30):
+    cmd = ["yt-dlp", "--skip-download", "--no-warnings", "--no-call-home",
+           "--print", "%(channel)s\t%(channel_id)s\t%(title)s",
+           "--sleep-requests", str(sleep), "-i",
+           "https://www.youtube.com/watch?v=" + vid]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    line = (r.stdout or "").strip()
+    if not line:
+        return None
+    parts = line.split("\t")
+    if len(parts) < 2 or not parts[1]:
+        return None
+    return {
+        "channel": parts[0] or None,
+        "channel_url": "https://www.youtube.com/channel/" + parts[1],
+        "title": parts[2] if len(parts) > 2 and parts[2] else None,
+    }
+
+
+def ytdlp_batch(ids, sleep=0, timeout=60):
+    chunk = 150
+    out = {}
+    cmd = ["yt-dlp", "--skip-download", "--no-warnings", "--no-call-home",
+           "--print", "%(id)s\t%(channel)s\t%(channel_id)s\t%(title)s",
+           "--sleep-requests", str(sleep), "-i"]
+    for i in range(0, len(ids), chunk):
+        sub = ids[i:i + chunk]
+        try:
+            r = subprocess.run(cmd + ["https://www.youtube.com/watch?v=" + v
+                                      for v in sub],
+                               capture_output=True, text=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        for line in (r.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3 or not parts[2]:
+                continue
+            out[parts[0]] = {
+                "channel": parts[1] or None,
+                "channel_url": "https://www.youtube.com/channel/" + parts[2],
+                "title": parts[3] if len(parts) > 3 and parts[3] else None,
+            }
+    return out
+
+
+def enrich_channels(state, cfg, silent, quickfill=False):
+    recs = state.get("history") or []
+    cache = state.setdefault("video_cache", {})
+    backfill = {}
+    for r in recs:
+        if r.get("channel") and r["id"] not in backfill:
+            backfill[r["id"]] = (r["channel"], r.get("channel_url"))
+    for vid, info in cache.items():
+        if isinstance(info, dict) and info.get("channel") and vid not in backfill:
+            backfill[vid] = (info["channel"], info.get("channel_url"))
+    applied = 0
+    for r in recs:
+        if r.get("channel"):
+            continue
+        hit = backfill.get(r["id"])
+        if not hit:
+            continue
+        r["channel"], r["channel_url"] = hit
+        applied += 1
+    if not applied:
+        applied = 0
+    by_id = {}
+    cutoff = (now_utc() - datetime.timedelta(days=90)).isoformat()
+    for r in recs:
+        if r["id"] not in by_id:
+            by_id[r["id"]] = {"n": 0, "last": r["time"]}
+        by_id[r["id"]]["n"] += 1
+        if r["time"] > by_id[r["id"]]["last"]:
+            by_id[r["id"]]["last"] = r["time"]
+    missing = [vid for vid, info in by_id.items()
+               if vid not in cache and info["last"] >= cutoff]
+    known = {r["id"] for r in recs if r.get("channel")}
+    missing = [v for v in missing if v not in known]
+    if not missing:
+        return applied
+    missing.sort(key=lambda vid: (by_id[vid]["n"], by_id[vid]["last"]), reverse=True)
+    todo = missing[:cfg.get("enrich_limit", 150)]
+    if quickfill and len(missing) > len(todo):
+        last_cut = (now_utc() - datetime.timedelta(
+            days=cfg.get("hot_weeks", 2) * 7)).isoformat()
+        fresh = [v for v in missing if by_id[v]["last"] >= last_cut] or todo
+        todo = fresh
+    if not silent:
+        tag = " (quickfill)" if quickfill else ""
+        log("resolving %d unknown channel(s) via yt-dlp%s" % (len(todo), tag))
+    resolved = {}
+    if quickfill and len(todo) > 200:
+        workers = max(1, int(cfg.get("quickfill_enrich_workers", 12)))
+        chunks = [todo[i::workers] for i in range(workers)]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for part in ex.map(lambda ids: ytdlp_batch(ids, sleep=0, timeout=90),
+                               chunks):
+                resolved.update(part)
+    else:
+        workers = cfg.get("quickfill_enrich_workers", 12) if quickfill else 4
+        sleep, timeout = (0, 20) if quickfill else (0.5, 30)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for vid, info in zip(
+                    todo, ex.map(lambda v: ytdlp_meta(v, sleep=sleep,
+                                                      timeout=timeout), todo)):
+                if info:
+                    resolved[vid] = info
+    cache.update(resolved)
+    applied = 0
+    for r in recs:
+        info = cache.get(r["id"])
+        if not info:
+            continue
+        if not r.get("channel"):
+            r["channel"] = info["channel"]
+            r["channel_url"] = info["channel_url"]
+            applied += 1
+        if not r.get("title") and info.get("title"):
+            r["title"] = info["title"]
+    return applied
+
+
+def purge_ad_channels(cfg, channels, index, silent, state):
+    bans = {}
+    for ident, name in (state or {}).get("ad_landings", {}).items():
+        bans.setdefault(ident.lower(), name)
+    for name in cfg.get("ad_channel_names", []):
+        bans.setdefault(str(name).lower(), name)
+    ad_kw = [str(k).lower() for k in cfg.get("ad_keywords", []) if k]
+    excluded = {c.lower() for c in cfg.get("exclude_channels", [])}
+
+    doomed = collections.OrderedDict()
+
+    def _hit(name, key, url):
+        n = (name or "").lower()
+        if n in excluded:
+            return False
+        if n in bans or (key or "").lower() in bans or (url or "").lower() in bans:
+            return True
+        if ad_kw:
+            return any(w in n for w in ad_kw)
+        return False
+
+    for key, ch in channels.items():
+        if _hit(ch.get("name"), ch.get("key"), ch.get("url")):
+            doomed[key] = ch["name"]
+    for info in index.values():
+        if _hit(info.get("name"), info.get("channel"), None):
+            doomed.setdefault(info.get("channel"), info.get("name") or "?")
+
+    if not doomed:
+        return 0
+    removed = 0
+    for key in doomed:
+        for vid, info in list(index.items()):
+            if info.get("channel") != key:
+                continue
+            path = info.get("path")
+            try:
+                if path and os.path.isfile(path):
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+            index.pop(vid, None)
+        channels.pop(key, None)
+    _clean_empty_dirs(cfg["dest"])
+    add_excl = [n for n in sorted(set(doomed.values())) if n
+                and n.lower() not in excluded]
+    if add_excl:
+        cfg.setdefault("exclude_channels", []).extend(add_excl)
+        save_config(cfg)
+    if not silent:
+        log("purged %d ad channel(s), %d file(s): %s" %
+            (len(doomed), removed, ", ".join(add_excl or sorted(set(doomed.values())))))
+    return removed
+
+
+def analyze(cfg, records, now):
+    channels = collections.OrderedDict()
+    excluded = {c.lower() for c in cfg.get("exclude_channels", [])}
+    for r in records:
+        if not r.get("channel"):
+            continue
+        if excluded and r["channel"].lower() in excluded:
+            continue
+        key = channel_key(r)
+        ch = channels.setdefault(key, {
+            "key": key,
+            "name": r["channel"],
+            "url": r.get("channel_url"),
+            "watches": [],
+        })
+        ch["name"] = r["channel"]
+        if r.get("channel_url"):
+            ch["url"] = r["channel_url"]
+        ch["watches"].append(r)
+    hot_wd = cfg["hot_weeks"] * 7
+    cutoff = now - datetime.timedelta(days=hot_wd)
+    for ch in channels.values():
+        recent = [w for w in ch["watches"] if w["time"] >= cutoff.isoformat()]
+        distinct = len({w["id"] for w in recent})
+        ch["hot"] = distinct >= cfg["hot_min_watches"]
+        ch["distinct"] = distinct
+        ch["last"] = max(w["time"] for w in ch["watches"])
+    return channels
+
+
+def channel_distinct(cfg, ch, now=None):
+    now = now or now_utc()
+    days = max(cfg.get("hot_weeks", 2) * 7, 1)
+    cutoff = now - datetime.timedelta(days=days)
+    recent = [w for w in ch["watches"] if w["time"] >= cutoff.isoformat()]
+    return len({w["id"] for w in recent})
+
+
+def channel_budget(cfg, ch, now=None):
+    distinct = channel_distinct(cfg, ch, now)
+    per_video = cfg.get("budget_per_video")
+    if per_video:
+        gb = distinct * float(per_video)
+        gb = min(gb, float(cfg.get("budget_max_gb", 3.5)))
+        gb = max(gb, float(cfg.get("budget_min_gb", 1.0)))
+    else:
+        gb = None
+        for tier in sorted(cfg.get("budget_tiers") or [],
+                           key=lambda t: t.get("min_watches") or 0):
+            if distinct >= tier.get("min_watches"):
+                gb = tier.get("gb")
+        if gb is None:
+            gb = cfg.get("channel_budget_gb", 2)
+    return gb * 1024 ** 3
+
+
+def keyword_set(ch):
+    tokens = []
+    for w in ch["watches"]:
+        for word in re.findall(r"[\w'-]+", (w["title"] or "").lower()):
+            word = word.strip("'-")
+            if len(word) >= KEYWORD_MIN_LEN and word not in STOPWORDS:
+                tokens.append(word)
+    by_freq = collections.Counter(tokens)
+    return set(w for w, _ in by_freq.most_common(KEYWORD_TOPN))
+
+
+def fetch_recent_uploads(ch, n):
+    if not ch["url"]:
+        return []
+    cmd = ["yt-dlp", "--flat-playlist", "--quiet", "--no-warnings", "-J",
+           "--playlist-end", str(n), ch["url"]]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return []
+    out = []
+    for e in data.get("entries") or []:
+        if e and e.get("id") and e.get("title"):
+            out.append({"_type": "url", "id": e["id"], "title": e["title"],
+                        "url": "https://www.youtube.com/watch?v=" + e["id"]})
+    return out
+
+
+def _maybe_nag_takeout(cfg, state, silent):
+    if not cfg.get("takeout_nag", True):
+        return False
+    last = state.get("takeout_nag_last")
+    if last:
+        last_dt = _parse(last)
+        if (now_utc() - last_dt).days < 7:
+            return False
+    state["takeout_nag_last"] = now_utc().isoformat()
+    try:
+        subprocess.run(["open", "https://takeout.google.com/"],
+                       capture_output=True)
+        if not silent:
+            log("opened the Takeout page so you can renew your export schedule")
+    except OSError:
+        pass
+    return True
+
+
+def prune(cfg, channels, index, archive_lines, silent, state=None):
+    now = now_utc()
+    removed = 0
+    stale_guard = cfg.get("cold_days", 15) + cfg.get("stale_grace_days", 30)
+    if state and state.get("last_ingest"):
+        last = _parse(state["last_ingest"])
+        stale_days = (now - last).days if last else 0
+        if stale_days > stale_guard:
+            if not silent:
+                log("no fresh history for %d days; pausing deletions "
+                    "(feed likely stopped)" % stale_days)
+            _maybe_nag_takeout(cfg, state, silent)
+            return 0
+    cold_keys = {k for k, ch in channels.items()
+                 if (now - _parse(ch["last"])).days > cfg["cold_days"]}
+    prune_ids = {vid for vid, info in index.items() if info["channel"] in cold_keys}
+    if not prune_ids:
+        return 0
+    for vid in prune_ids:
+        path = index[vid]["path"]
+        try:
+            if os.path.isfile(path):
+                os.unlink(path)
+                removed += 1
+        except OSError:
+            pass
+    keep = [ln for ln in archive_lines if ln not in prune_ids]
+    p = paths_in_dest(cfg["dest"])
+    with open(p["archive"], "w") as fh:
+        fh.write("\n".join(keep))
+    for vid in prune_ids:
+        index.pop(vid, None)
+    _clean_empty_dirs(cfg["dest"])
+    if removed and not silent:
+        log("pruned %d video(s) from %d inactive channel(s)" % (removed, len(cold_keys)))
+    return removed
+
+
+def _parse(iso):
+    try:
+        return datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return now_utc()
+
+
+def _clean_empty_dirs(dest):
+    for root, dirs, _files in os.walk(dest, topdown=False):
+        for d in dirs:
+            full = os.path.join(root, d)
+            try:
+                if not os.listdir(full):
+                    os.rmdir(full)
+            except OSError:
+                pass
+
+
+def _folder_size(path):
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    total = 0
+    if not os.path.isdir(path):
+        return 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _simulate_sizes(cfg, urls, archive):
+    cmd = ["yt-dlp", "-f", FMT, "--skip-download", "--no-warnings",
+           "--no-call-home", "--print", "%(id)s\t%(filesize_approx)s",
+           "-i", "--download-archive", archive] + urls
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    sizes = {}
+    for line in (r.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[0]:
+            continue
+        try:
+            sizes[parts[0]] = float(parts[1])
+        except ValueError:
+            sizes[parts[0]] = None
+    return sizes
+
+
+def _drop_indexed_files(cfg, index, archive_lines, ids, silent, skip_ids=None):
+    removed = 0
+    now = now_utc()
+    for vid in list(ids):
+        info = index.get(vid)
+        if not info:
+            continue
+        if skip_ids and vid in skip_ids:
+            continue
+        try:
+            if os.path.isfile(info["path"]):
+                os.unlink(info["path"])
+                removed += 1
+        except OSError:
+            pass
+        index.pop(vid, None)
+    return removed
+
+
+def download(cfg, channels, index, silent, dry=False, state=None, no_rotate=False,
+             topup=False, quickfill=False, logs=False):
+    p = paths_in_dest(cfg["dest"])
+    archive = p["archive"]
+    if not os.path.exists(archive):
+        open(archive, "w").close()
+    with open(archive) as fh:
+        archive_lines = {ln.strip() for ln in fh if ln.strip()}
+    were_files = set(index.keys())
+    if prune(cfg, channels, index, archive_lines, silent, state):
+        with open(archive) as fh:
+            archive_lines = {ln.strip() for ln in fh if ln.strip()}
+
+    cache = (state or {}).get("video_cache", {})
+    reconcile_index(cfg, index, cache, silent)
+ 
+    now = now_utc()
+    rot_days = max(cfg.get("hot_weeks", 2) * 7, 1)
+    if quickfill:
+        topup = True
+        no_rotate = True
+
+    recents = None
+    if quickfill and not dry:
+        hot_list = [ch for ch in channels.values() if ch["hot"]
+                    and keyword_set(ch)]
+        if hot_list:
+            recents = {}
+            nf = cfg.get("quickfill_recent", 100)
+            with ThreadPoolExecutor(
+                    max_workers=int(cfg.get("quickfill_workers", 8))) as ex:
+                for key, up in ex.map(
+                        lambda c: (c["key"],
+                                   fetch_recent_uploads(c, nf)), hot_list):
+                    recents[key] = up
+
+    for ch in channels.values():
+        if not ch["hot"]:
+            continue
+        meta = (state or {}).setdefault("channels", {}).setdefault(ch["key"], {})
+        last_rot = meta.get("last_rotate")
+        due = (last_rot is None) or ((now - _parse(last_rot)).days >= rot_days)
+        if not due and not topup:
+            continue
+
+        watched = sorted(ch["watches"], key=lambda w: w["time"], reverse=True)
+        seen = set()
+        cand = []
+        for w in watched:
+            if w["id"] in seen or w["id"] in archive_lines or w["id"] in were_files:
+                continue
+            seen.add(w["id"])
+            cand.append({"id": w["id"], "url": "https://www.youtube.com/watch?v=" + w["id"]})
+
+        kws = keyword_set(ch)
+        if not dry and kws:
+            if recents is not None:
+                recent = recents.get(ch["key"]) or []
+            else:
+                recent = fetch_recent_uploads(ch, cfg.get("recent_uploads", 30))
+            for up in recent:
+                tl = (up["title"] or "").lower()
+                if up["id"] not in archive_lines and up["id"] not in were_files \
+                        and any(k in tl for k in kws):
+                    cand.append(up)
+
+        if not cand:
+            continue
+
+        used = sum(_folder_size(info["path"]) for info in index.values()
+                   if info.get("channel") == ch["key"])
+        budget = channel_budget(cfg, ch)
+        headroom = budget - used
+        margin = cfg.get("pack_margin", 0.92) if not quickfill \
+            else cfg.get("quickfill_margin", 0.95)
+        if headroom <= 0:
+            if not silent:
+                log("%s already at/over %.1fGB budget (%.2fGB on disk)" %
+                    (ch["name"], budget / 1e9, used / 1e9))
+            continue
+
+        sizes = {}
+        acc = 0.0
+        if not dry and quickfill:
+            members = [info for info in index.values()
+                       if info.get("channel") == ch["key"]]
+            msz = [_folder_size(info["path"]) for info in members]
+            est = (sum(msz) / len(msz)) if msz else 90 * 1024 * 1024
+            n = max(1, int((headroom * margin) / est))
+            pack = cand[:n]
+            acc = est * len(pack)
+        else:
+            if not dry:
+                sizes = _simulate_sizes(cfg, [d["url"] for d in cand], archive)
+            pack = []
+            if sizes:
+                for d in cand:
+                    sz = sizes.get(d["id"])
+                    if sz is None:
+                        sz = 0.0
+                    if pack and acc + sz > headroom * margin:
+                        break
+                    acc += sz
+                    pack.append(d)
+            elif not dry:
+                members = [info for info in index.values()
+                           if info.get("channel") == ch["key"]]
+                msz = [_folder_size(info["path"]) for info in members]
+                est = (sum(msz) / len(msz)) if msz else 90 * 1024 * 1024
+                n = max(1, int((headroom * margin) / est))
+                pack = cand[:n]
+                acc = est * len(pack)
+            else:
+                acc += 0.0
+                pack = cand[:]
+
+        if not pack:
+            if not silent:
+                log("no room under %.1fGB budget for %s" %
+                    (budget / 1e9, ch["name"]))
+            continue
+
+        label = "would download" if dry else "downloading"
+        if not silent:
+            log("%s %d video(s) (~%.0f MB) from %s" %
+                (label, len(pack), acc / 1e6, ch["name"]))
+        if dry:
+            for d in pack:
+                log("  - %s" % d["id"], silent)
+            continue
+
+        qf_cookies = None
+        qf_cookies_file = None
+        if quickfill and cfg.get("quickfill_cookies"):
+            cq = os.path.expanduser(str(cfg.get("quickfill_cookies")))
+            if os.path.isfile(cq):
+                qf_cookies_file = cq
+            else:
+                qf_cookies = cfg.get("quickfill_cookies")
+        outs = _run_download(cfg, archive, [d["url"] for d in pack],
+                             parallel=int(cfg.get("quickfill_workers", 8) if quickfill else 0),
+                             fragment_limit=int(cfg.get("quickfill_fragments", 16) if quickfill else 0),
+                             aria2c=bool(quickfill and cfg.get("quickfill_aria2c", True)),
+                             stream=logs,
+                             cookies=qf_cookies,
+                             cookies_file=qf_cookies_file)
+        downloaded = set()
+        for line in outs:
+            if not line.strip():
+                continue
+            m = re.search(r"\[([A-Za-z0-9_-]{11})\](?:\.\w+)?$", line.strip())
+            if m:
+                index[m.group(1)] = {
+                    "channel": ch["key"],
+                    "name": ch["name"],
+                    "path": line.strip(),
+                    "t": now.isoformat(),
+                }
+                downloaded.add(m.group(1))
+
+        if downloaded:
+            meta["last_rotate"] = now.isoformat()
+            if no_rotate:
+                if not silent:
+                    log("rotated download set for %s (swap deferred)" % ch["name"])
+                if topup:
+                    _trim_to_budget(cfg, index, archive_lines, ch["key"], budget, silent)
+                continue
+            old_ids = [vid for vid, info in index.items()
+                       if info["channel"] == ch["key"]]
+            removed = _drop_indexed_files(cfg, index, archive_lines, old_ids,
+                                          silent, skip_ids=downloaded)
+            if removed and not silent:
+                log("rotated out %d old video(s) for %s" % (removed, ch["name"]))
+            _trim_to_budget(cfg, index, archive_lines, ch["key"], budget, silent)
+
+        with open(archive, "w") as fh:
+            fh.write("\n".join(d for d in archive_lines if d))
+        _clean_empty_dirs(cfg["dest"])
+        if quickfill and downloaded and state is not None:
+            save_state(p["state"], state)
+
+
+def _trim_to_budget(cfg, index, archive_lines, chkey, budget, silent):
+    members = [info for info in index.values() if info["channel"] == chkey]
+    if not members:
+        return
+    while True:
+        total = sum(_folder_size(info["path"]) for info in members)
+        if total <= budget:
+            return
+        members.sort(key=lambda info: info.get("t", ""))
+        drop = members[0]
+        try:
+            if os.path.isfile(drop["path"]):
+                os.unlink(drop["path"])
+        except OSError:
+            pass
+        vid = next((v for v, i in index.items() if i is drop), None)
+        if vid:
+            archive_lines.discard(vid)
+            index.pop(vid, None)
+        members.remove(drop)
+
+
+def reconcile_index(cfg, index, cache, silent):
+    dest = cfg["dest"]
+    now = now_utc()
+    pat = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.(mp4|mkv|webm|m4v|flv)$")
+    added = 0
+    for root, _dirs, files in os.walk(dest):
+        rel = os.path.relpath(root, dest)
+        if rel == "." or rel.startswith(".yosync") or rel.startswith("inbox"):
+            continue
+        for fn in files:
+            m = pat.search(fn)
+            if not m:
+                continue
+            vid = m.group(1)
+            if vid in index:
+                continue
+            meta = cache.get(vid, {})
+            folder = os.path.basename(root)
+            index[vid] = {
+                "channel": meta.get("channel_url") or folder,
+                "name": meta.get("channel") or folder,
+                "path": os.path.join(root, fn),
+                "t": now.isoformat(),
+            }
+            added += 1
+    if added and not silent:
+        log("reconciled %d file(s) into index from disk" % added)
+    return added
+
+
+def _run_download(cfg, archive, urls, parallel=0, fragment_limit=0,
+                  aria2c=False, stream=False, cookies=None, cookies_file=None):
+    p = paths_in_dest(cfg["dest"])
+    cmd = ["yt-dlp", "-f", FMT, "--merge-output-format", "mp4",
+           "--download-archive", archive,
+           "-o", os.path.join(cfg["dest"], "%(uploader)s", "%(title)s [%(id)s].%(ext)s"),
+           "--print", "after_move:filepath",
+           "--sleep-requests", "1", "-i",
+           "--retries", "5", "--fragment-retries", "10",
+           "--extractor-retries", "3"]
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    elif cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    if aria2c and shutil.which("aria2c"):
+        cmd += ["--downloader", "aria2c",
+                "--downloader-args", "aria2c:-x 16 -s 16 -k 1M"]
+    elif fragment_limit > 1:
+        cmd += ["--concurrent-fragments", str(fragment_limit)]
+
+    def run(urls):
+        if stream:
+            proc = subprocess.Popen(cmd + urls, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    bufsize=1)
+            lines = []
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                lines.append(line)
+                print(line, flush=True)
+            proc.wait()
+        else:
+            r = subprocess.run(cmd + urls, capture_output=True, text=True)
+            lines = r.stdout.splitlines()
+        if lines:
+            try:
+                with open(p["logfile"], "a") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            except OSError:
+                pass
+        return lines
+
+    if parallel > 1 and len(urls) > 1:
+        batches = [b for b in (urls[i::parallel] for i in range(parallel)) if b]
+        outs = []
+        with ThreadPoolExecutor(max_workers=parallel) as ex:
+            for part in ex.map(run, batches):
+                outs.extend(part)
+        return outs
+    return run(urls)
+
+
+def free_space(cfg):
+    try:
+        usage = shutil.disk_usage(cfg["dest"])
+        return usage
+    except OSError:
+        return None
+
+
+def report(cfg, state, channels, silent):
+    hot = [c for c in channels.values() if c["hot"]]
+    if not silent:
+        log("channels: %d hot, %d total" % (len(hot), len(channels)))
+        for ch in hot:
+            log("  * %s (~%.1f GB budget, %d vids in %dw)" %
+                (ch["name"], channel_budget(cfg, ch) / 1e9,
+                 ch.get("distinct") or channel_distinct(cfg, ch),
+                 max(cfg.get("hot_weeks", 2), 1)))
+        usage = free_space(cfg)
+        if usage:
+            log("free on disk: %.1f GB" % (usage.free / 1e9))
+    state["last_run"] = now_utc().isoformat()
+
+
+def save_state(state_path, state):
+    tmp = state_path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=1)
+    os.replace(tmp, state_path)
+
+
+def setup_wizard(cfg, args, silent):
+    interactive = not args.dest and not silent
+    dest = cfg["dest"]
+    if interactive:
+        log("yosync setup")
+        ans = input("Offline folder [%s]: " % dest).strip()
+        if ans:
+            dest = os.path.expanduser(ans)
+        cfg["dest"] = dest
+    cfg.setdefault("daemon", False)
+    daemon = args.daemon
+    if args.no_daemon:
+        daemon = False
+    if daemon is None and args.dest and not args.no_daemon and not args.silent and not interactive:
+        daemon = True
+    if daemon is None and interactive:
+        ans = input("Auto-sync daily in the background? [y/N]: ").strip().lower()
+        daemon = ans in ("y", "yes")
+    cfg["daemon"] = bool(daemon)
+    ensure_dirs(cfg)
+    p = paths_in_dest(cfg["dest"])
+    with open(p["archive"], "a"):
+        pass
+    save_config(cfg)
+    dirs = ["Downloads", "Applications", "Documents", "Music"]
+    urls = []
+    print("")
+    print("SYNC EVERYTHING:");
+    print("  1. Visit https://takeout.google.com")
+    print("  2. Deselect all, then select only: YouTube and YouTube Music")
+    for name in ("YouTube and YouTube Music", "YouTube"):
+        urls.append("https://takeout.google.com/settings/takeout")
+    print("  3. Format = JSON, frequency = Export once")
+    print("  4. Create export, download the zip")
+    print("  5. Drop the zip into: %s" % p["inbox"])
+    write_daemon(daemon, cfg, silent)
+    log("setup done. when ready, run: yosync", silent)
+
+
+def write_daemon(daemon, cfg, silent):
+    if daemon and _ytdlp_missing():
+        log("note: yt-dlp not found; install with: brew install yt-dlp", silent)
+    plist = {
+        "Label": "com.vyom.yosync",
+        "ProgramArguments": [sys.executable, os.path.abspath(__file__),
+                             "--drive", "--silent"],
+        "StartCalendarInterval": {"Hour": 6, "Minute": 0},
+        "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+        "StandardOutPath": os.path.join(cfg["dest"], "logs", "sync.log"),
+        "StandardErrorPath": os.path.join(cfg["dest"], "logs", "sync.log"),
+    }
+    if not daemon:
+        _unload_daemon(silent)
+        return
+    os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
+    with open(PLIST_PATH, "wb") as fh:
+        plistlib.dump(plist, fh)
+    _load_daemon(silent)
+    if not silent:
+        log("background sync scheduled daily at 6am")
+
+
+def _ytdlp_missing():
+    return shutil.which("yt-dlp") is None
+
+
+def _load_daemon(silent):
+    try:
+        subprocess.run(["launchctl", "load", "-w", PLIST_PATH],
+                       capture_output=True)
+    except OSError:
+        pass
+
+
+def _unload_daemon(silent):
+    if not os.path.exists(PLIST_PATH):
+        return
+    try:
+        subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
+    except OSError:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="yosync",
+        description="Keep an offline YouTube library based on what you actually watch.",
+        epilog="examples:\n"
+               "  yosync                  sync now\n"
+               "  yosync --setup          guided setup\n"
+               "  yosync --dry-run        preview without downloading\n"
+               "  yosync --daemon         enable daily background sync\n"
+               "  yosync --no-daemon      disable background sync\n"
+               "  yosync --topup          fill hot channels toward budget now\n"
+               "  yosync --quickfill      fast fill, heavy parallelism (Ctrl+C to abort)")
+    ap.add_argument("--setup", action="store_true", help="run setup wizard")
+    ap.add_argument("--dest", help="offline folder (default ~/Movies/OfflineYouTube)")
+    ap.add_argument("--dry-run", action="store_true", help="preview only, no downloads")
+    ap.add_argument("--daemon", action="store_true", help="enable background sync")
+    ap.add_argument("--no-daemon", action="store_true", help="disable background sync")
+    ap.add_argument("--silent", action="store_true", help="no output, log to file")
+    ap.add_argument("--ingest", help="process a specific takeout file instead of inbox")
+    ap.add_argument("--drive", action="store_true",
+                    help="pull latest watch history from Google Drive first")
+    ap.add_argument("--no-rotate", action="store_true",
+                    help="download within budget but skip the rotation swap")
+    ap.add_argument("--topup", action="store_true",
+                    help="ignore the 2-week rotation lock and fill hot channels toward budget now")
+    ap.add_argument("--quickfill", action="store_true",
+                    help="dedicated fast fill using most system resources "
+                         "(parallel + aria2c if present); Ctrl+C aborts and "
+                         "normal background filling resumes unchanged")
+    ap.add_argument("--logs", action="store_true",
+                    help="stream yt-dlp download logs to stdout while running")
+    args = ap.parse_args()
+
+    if args.ingest and (args.daemon or args.no_daemon or args.setup):
+        ap.error("--ingest cannot be combined with setup/daemon flags")
+
+    _lock = acquire_lock()
+    cfg = load_config(silent=args.silent)
+    if args.setup:
+        cfg = cfg or default_config(args.dest or DEFAULT_DEST)
+        setup_wizard(cfg, args, args.silent)
+        cfg = load_config(silent=args.silent)
+    elif not cfg:
+        cfg = default_config(args.dest or DEFAULT_DEST)
+        setup_wizard(cfg, args, args.silent)
+        cfg = load_config(silent=args.silent)
+
+    if (args.daemon or args.no_daemon) and not args.setup:
+        daemon = not args.no_daemon
+        cfg["daemon"] = daemon
+        save_config(cfg)
+        write_daemon(daemon, cfg, args.silent)
+        if not args.silent:
+            log("background sync %s" %
+                ("enabled (daily 6am)" if daemon else "disabled"))
+        return
+
+    p = paths_in_dest(cfg["dest"])
+    ensure_dirs(cfg)
+
+    state = {}
+    if os.path.exists(p["state"]):
+        try:
+            with open(p["state"]) as fh:
+                state = json.load(fh)
+        except ValueError:
+            state = {}
+
+    if args.drive:
+        rclone_pull(cfg, args.silent)
+
+    if args.ingest:
+        if not os.path.isfile(args.ingest):
+            log("file not found: %s" % args.ingest, args.silent)
+            sys.exit(1)
+        files = [args.ingest]
+    else:
+        files = ingest_files(cfg, state, args.silent)
+
+    if files:
+        state["last_ingest"] = now_utc().isoformat()
+        state.pop("takeout_nag_last", None)
+        save_state(p["state"], state)
+
+    total = 0
+    ads = state.setdefault("ad_landings", {})
+    for f in files:
+        try:
+            total += merge_history(state, load_watch_history(f, args.silent, ads=ads))
+        except (ValueError, OSError, KeyError) as e:
+            log("failed to parse %s: %s" % (os.path.basename(f), e), args.silent)
+
+    now = now_utc()
+    try:
+        enrich_channels(state, cfg, args.silent, quickfill=args.quickfill)
+        channels = analyze(cfg, state.get("history", []), now)
+        purge_ad_channels(cfg, channels, state.setdefault("index", {}),
+                          args.silent, state)
+
+        if args.silent:
+            logfile = p["logfile"]
+        else:
+            logfile = None
+
+        if not channels and not total and not state.get("history"):
+            log("no watch history yet. export it at takeout.google.com and "
+                "drop the zip into %s" % p["inbox"], args.silent, logfile)
+            save_state(p["state"], state)
+            return
+
+        download(cfg, channels, state.setdefault("index", {}),
+                 args.silent, dry=args.dry_run, state=state,
+                 no_rotate=args.no_rotate, topup=args.topup,
+                 quickfill=args.quickfill, logs=args.logs and not args.silent)
+        report(cfg, state, channels, args.silent)
+        save_state(p["state"], state)
+
+        if args.dry_run and not args.silent:
+            log("dry run complete: nothing downloaded")
+    except KeyboardInterrupt:
+        try:
+            save_state(p["state"], state)
+        except (OSError, ValueError):
+            pass
+        if args.quickfill:
+            log("QuickFill stopped.", args.silent)
+        else:
+            log("Stopped.", args.silent)
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
