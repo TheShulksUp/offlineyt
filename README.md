@@ -1,13 +1,38 @@
 # OfflineYT · your own offline YouTube library
 
-Mirror the channels you **actually watch** to a local/iCloud library, driven by your **Google Takeout watch history**.
+> Mirror the channels you **actually watch** to a local/iCloud library — driven by your **Google Takeout watch history**.
 
-- Watches only what you genuinely watch or follow — no giant bulk channel grabs.
-- Per-channel budgets with automatic rotation (newest in, oldest out).
-- Understands the new Google Takeout format (incl. ads, which it skips and purges).
-- A 6am background daemon keeps it fresh on its own.
+## Why
 
-The engine is a single-file Python tool: **[`bin/yosync`](bin/yosync)**.
+YouTube is a stream, but good content isn't. If you want the videos you care about **backed up, ad-free and forever yours**, there was no clean way to do it: downloading a whole channel wastes disk on things you never watch, and manual `yt-dlp` one-offs don't scale across the channels you follow.
+
+OfflineYT solves the *"mirror what I actually watch"* problem:
+
+- **Finds the channels you genuinely watch** — from your real Google Takeout history, not guesses.
+- **Continuous budgets, not limits per 100 videos** — budget scales with how much each channel means to you (≈0.17 GB per distinct video watched, clamped to 1–3.5 GB).
+- **Auto-rotation** — newest in, oldest out, so your library never grows unbounded.
+- **Ad / bot driven junk gets skipped & purged automatically** (incl. the new Google Takeout ad format).
+- **Runs itself** — a 6am background daemon keeps everything fresh.
+
+The engine is a single-file Python tool: **[`bin/yosync`](bin/yosync)** — no services, no account, your data stays yours.
+
+---
+
+## Quick peek
+
+```
+$ python3 ~/bin/yosync --dry-run
+
+11 hot channels (≥4 distinct videos watched in the last 2 weeks)
+budget: 0.17 GB per distinct video → 1.0–3.5 GB per channel
+
+  SomeTechChannel    3.5 GB budget · 0.2 GB on disk · 13 videos queued
+  SomeChannel        2.0 GB budget · 0.1 GB on disk ·  7 videos queued
+  ...
+10 channels spent, 22 GB mirrored · 5 ad channels auto-excluded
+```
+
+*(sample output — run it on your own data to see yours)*
 
 ---
 
@@ -208,3 +233,19 @@ yt-dlp -f "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]" \
 | "all channels locked" on a normal run | that's rotation doing its job — `--topup` / `--quickfill` to override |
 | channels never reach budget | they're mostly Shorts or the videos are deleted — nothing left to download |
 | nothing happens at 6am | check `logs/sync.log`; `launchctl list \| grep yosync` |
+
+---
+
+## Roadmap & PRs welcome
+
+Ideas worth building next — pitch or submit one:
+
+- **Windows / Linux support** for the daemon (systemd timer instead of launchd).
+- **Watched-progress import** of the new Takeout **.csv** format.
+- **Inbox watcher** that auto-queues videos you save via a "watch for me later" shortcut.
+- **Budget presets** (feather / balanced / hoarder) as a single config flag.
+- **Portable bundles** (PyInstaller) so non-technical people can skip the install.
+
+Found a bug or have an idea? Open an [issue](https://github.com/TheShulksUp/offlineyt/issues) or start a [discussion](https://github.com/TheShulksUp/offlineyt/discussions).
+
+If this saved your back catalog, **give the repo a ⭐** — it's what keeps side-projects like this alive.
