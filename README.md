@@ -23,16 +23,18 @@ The engine is a single-file Python tool: **[`bin/yosync`](bin/yosync)** — no s
 ```
 $ python3 ~/bin/yosync --dry-run
 
-11 hot channels (≥4 distinct videos watched in the last 2 weeks)
-budget: 0.17 GB per distinct video → 1.0–3.5 GB per channel
-
-  SomeTechChannel    3.5 GB budget · 0.2 GB on disk · 13 videos queued
-  SomeChannel        2.0 GB budget · 0.1 GB on disk ·  7 videos queued
-  ...
-10 channels spent, 22 GB mirrored · 5 ad channels auto-excluded
+[2026-03-14 09:12:04] resolving 96 unknown channel(s) via yt-dlp
+[2026-03-14 09:12:58] would download 2 video(s) (~140 MB) from SomeTechChannel
+[2026-03-14 09:12:58] channels: 14 hot, 921 total
+[2026-03-14 09:12:58]   * SomeTechChannel    (~3.2 GB budget, 18 vids in 2w)
+[2026-03-14 09:12:58]   * CookingWithX       (~1.8 GB budget, 10 vids in 2w)
+[2026-03-14 09:12:58]   * TravelVlogger      (~1.1 GB budget,  5 vids in 2w)
+[2026-03-14 09:12:58]   ...
+[2026-03-14 09:12:58] free on disk: 402.1 GB
+[2026-03-14 09:12:58] dry run complete: nothing downloaded
 ```
 
-*(sample output — run it on your own data to see yours)*
+*(sample output — run it on your own data to see yours; budgets shown are decimal, matching the tool's own report)*
 
 ---
 
