@@ -24,9 +24,9 @@ The library looks like this:
 
 ```
 ~/Library/Mobile Documents/com~apple~CloudDocs/OfflineYT/
-├── Gohar Khan/
-├── ElliotSimms/
-├── Mrwhosetheboss/
+├── SomeChannel/
+├── AnotherChannel/
+├── ThirdChannel/
 │     └── Title [videoID].mp4
 ├── inbox/              # scratch, normally empty
 └── .yosync/
