@@ -441,6 +441,7 @@ def _state_payload(cfg):
     except (OSError, ValueError):
         pass
     hot = []
+    channels = {}
     overrides = cfg.get("channel_budget_overrides") or {}
     try:
         channels = analyze(cfg, state.get("history") or [], now_utc())
@@ -457,12 +458,24 @@ def _state_payload(cfg):
     except Exception:
         pass
     usage = free_space(cfg)
+    try:
+        size_gb = round(library_size(cfg["dest"]) / 1e9, 1)
+    except (OSError, KeyError, TypeError):
+        size_gb = None
     return {
         "dest": cfg.get("dest"),
         "last_run": state.get("last_run"),
         "last_ingest": state.get("last_ingest"),
         "history": len(state.get("history") or []),
         "index": len(state.get("index") or {}),
+        "channels": len(channels),
+        "hot_count": len(hot),
+        "size_gb": size_gb,
+        "daemon": daemon_installed(),
+        "daemon_next": daemon_next_run(),
+        "ad_videos": len(state.get("ad_videos") or {}),
+        "ad_channels": len(state.get("ad_landings") or {}),
+        "ad_purged": len(state.get("ad_purged_channels") or []),
         "hot": hot,
         "free_gb": round(usage.free / 1e9, 1) if usage else None,
     }
@@ -642,13 +655,24 @@ async function save(){try{await api('/api/config',{method:'POST',headers:{'Conte
 async function renderStatus(){
  const s=await api('/api/state');const root=$('#view');root.innerHTML='';
  const cards=[
-  ['Last run',esc(s.last_run||'—')],
-  ['Last ingest',esc(s.last_ingest||'—')],
   ['Videos in library',s.index],
-  ['History records',s.history],
+  ['Size on disk',(s.size_gb!=null?s.size_gb+' GB':'—')],
+  ['Channels tracked',(s.channels!=null?s.channels:'—')],
+  ['Hot channels',(s.hot_count!=null?s.hot_count:(s.hot||[]).length)],
   ['Free space',(s.free_gb!=null?s.free_gb+' GB':'—')],
+  ['Background sync',s.daemon?'<span class="badge audio">on &middot; '+(esc(s.daemon_next||'scheduled'))+'</span>':'<span class="badge">off &middot; run <code>yosync --daemon</code></span>'],
  ];
- root.innerHTML='<div class="cards">'+cards.map(c=>'<div class="card"><div class="v">'+c[1]+'</div><div class="k">'+c[0]+'</div></div>').join('')+'</div>';
+ root.innerHTML+='<div class="group"><h2>Library</h2><p>'+esc(s.dest||'')+'</p><div class="cards">'+cards.map(c=>'<div class="card"><div class="v">'+c[1]+'</div><div class="k">'+c[0]+'</div></div>').join('')+'</div></div>';
+ const rows=[
+  ['Last sync',esc(s.last_run||'never — run <code>yosync</code> to start')],
+  ['Last ingest',esc(s.last_ingest||'no Takeout ingested yet')],
+  ['Watch-history records',s.history],
+  ['Ad videos tracked',s.ad_videos],
+  ['Ad channels resolved',s.ad_channels],
+  ['Ad channels purged',s.ad_purged],
+ ];
+ root.innerHTML+='<div class="group"><h2>Sync</h2><div class="rows">'+rows.map(r=>'<div class="row"><label>'+r[0]+'</label><div>'+r[1]+'</div></div>').join('')+'</div>'+
+  '<p class="muted">Ad videos are only ever deleted when a video was ad-served <em>and</em> never watched on purpose; a channel you actually watch is never auto-purged.</p></div>';
  root.innerHTML+='<div class="group"><h2>Hot channels</h2><p>Budgets come from your watch history. Per-channel overrides override the formula.</p><table><tr><th>Channel</th><th>Budget</th><th>Videos (2w)</th><th>Type</th></tr>'+
   (s.hot||[]).map(h=>'<tr><td>'+esc(h.name)+'</td><td>'+esc(h.budget_gb)+' GB</td><td>'+esc(h.distinct)+'</td><td>'+(h.audio?'<span class="badge audio">audio</span>':'<span class="badge">video</span>')+(h.override?' <span class="badge">override</span>':'')+'</td></tr>').join('')+'</table></div>';
  if(!(s.hot||[]).length)root.innerHTML+='<p class="muted">No hot channels yet — ingest some watch history first.</p>';
@@ -1859,6 +1883,25 @@ def free_space(cfg):
         return None
 
 
+def library_size(dest):
+    """Bytes on disk in the library, ignoring yosync's own metadata dir.
+
+    Counted from disk rather than from the index on purpose: the Status page
+    is where you go to find out about files the index does not know about yet
+    (and about ones it thinks exist but are gone).
+    """
+    total = 0
+    for root, dirs, files in os.walk(dest):
+        if ".yosync" in dirs:
+            dirs.remove(".yosync")
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
 def report(cfg, state, channels, silent):
     hot = [c for c in channels.values() if c["hot"]]
     if not silent:
@@ -1944,6 +1987,43 @@ def write_daemon(daemon, cfg, silent):
     _load_daemon(silent)
     if not silent:
         log("background sync scheduled daily at 6am")
+
+
+def daemon_installed():
+    """Is a background sync actually scheduled?
+
+    Asks the OS rather than trusting cfg["daemon"]: the schedule lives in the
+    LaunchAgent plist / systemd timer, and those can disagree with the config
+    (a config restored from a backup, a plist left behind by `yosync
+    --no-daemon`). Status should report what will actually run at 6am.
+    """
+    if sys.platform != "darwin":
+        try:
+            r = _systemctl_user("is-enabled", "yosync.timer")
+            return (r.stdout or "").strip() == "enabled"
+        except OSError:
+            return False
+    if not os.path.exists(PLIST_PATH):
+        return False
+    try:
+        with open(PLIST_PATH, "rb") as fh:
+            return plistlib.load(fh).get("StartCalendarInterval") is not None
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+
+
+def daemon_next_run():
+    """Human-readable next scheduled run, or None if unscheduled."""
+    if not daemon_installed():
+        return None
+    if sys.platform != "darwin":
+        return "on timer (systemd)"
+    try:
+        with open(PLIST_PATH, "rb") as fh:
+            when = plistlib.load(fh).get("StartCalendarInterval") or {}
+        return "daily %02d:%02d" % (when.get("Hour", 0), when.get("Minute", 0))
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return "scheduled"
 
 
 def _systemctl_user(*args):
@@ -2165,7 +2245,14 @@ def main():
     if args.ingest and (args.daemon or args.no_daemon or args.setup or args.serve):
         ap.error("--ingest cannot be combined with setup/daemon/serve flags")
 
-    _lock = acquire_lock()
+    # --serve only reads config and serves a local page, so it must NOT take
+    # the sync lock: acquire_lock() blocks, which meant that with a sync
+    # running the browser opened to "connection refused" and the whole page
+    # (Status included) looked like it had never been set up. The lock exists
+    # to stop two *syncs* colliding over state.json and the library, and a
+    # settings page collides with neither -- a config save is picked up by the
+    # next sync, since each run loads its config once at startup.
+    _lock = None if args.serve else acquire_lock()
     cfg = load_config(silent=args.silent)
     if args.serve and not cfg:
         cfg = default_config(args.dest or DEFAULT_DEST)
