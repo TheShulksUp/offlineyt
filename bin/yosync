@@ -175,6 +175,17 @@ def default_config(dest):
         "exclude_channels": [],
         "ad_channel_names": [],
         "ad_keywords": [],
+        "pack_margin": 0.92,
+        "stale_grace_days": 30,
+        "takeout_nag": True,
+        "settings_port": 8765,
+        "include_shorts": True,
+        "subtitles": False,
+        "subtitle_langs": ["en"],
+        "audio_only_channels": [],
+        "channel_budget_overrides": {},
+        "verify_media": True,
+        "verify_min_size_mb": 1,
     }
 
 

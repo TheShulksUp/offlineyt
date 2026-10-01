@@ -171,8 +171,18 @@ python3 ~/bin/yosync --quickfill --logs
 | `budget_per_video` | `0.17` | **continuous budget: GB per distinct video watched** |
 | `budget_min_gb` / `budget_max_gb` | `1.0` / `3.5` | clamp the formula to this range (GiB) |
 | `budget_tiers` | see example | fallback tier list when `budget_per_video` is absent |
+| `channel_budget_overrides` | `{}` | per-channel budgets: channel name/URL → GB (never clamped) |
+| `audio_only_channels` | `[]` | names/URLs mirrored as mp3 (podcast-style) instead of video |
+| `include_shorts` | `true` | set false to skip videos shorter than 60s |
+| `subtitles` | `false` | download subs; `subtitle_langs` (default `["en"]`) picks languages |
+| `verify_media` | `true` | integrity-check new downloads (ffprobe); failed files are re-queued |
 | `cold_days` | `14` | prune channels with no watch in this many days |
+| `stale_grace_days` | `30` | extra pause before pruning when history has gone stale |
+| `pack_margin` | `0.92` | keep this fraction of budget headroom per download pack |
 | `quickfill_*` | see example | parallelism, margins, aria2, cookie source |
+| `settings_port` | `8765` | localhost port for the `--serve` settings page |
+
+> All of these (and everything else) can be edited from the in-browser settings page: **`yosync --serve`** — no JSON editing required.
 
 Rotation model:
 

@@ -31,5 +31,16 @@
   "daemon": false,
   "exclude_channels": [],
   "ad_channel_names": [],
-  "ad_keywords": []
+  "ad_keywords": [],
+  "pack_margin": 0.92,
+  "stale_grace_days": 30,
+  "takeout_nag": true,
+  "settings_port": 8765,
+  "include_shorts": true,
+  "subtitles": false,
+  "subtitle_langs": ["en"],
+  "audio_only_channels": [],
+  "channel_budget_overrides": {},
+  "verify_media": true,
+  "verify_min_size_mb": 1
 }
