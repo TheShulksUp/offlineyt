@@ -81,16 +81,30 @@ The library looks like this:
 
 ---
 
-## Setup (5 minutes)
+## Setup (two options)
 
-1. **Put the tool on PATH**
+### A) One-click (macOS) — recommended
+
+Grab **`Setup.command`** from the repo root and double-click it. It installs Homebrew,
+Python, yt-dlp, ffmpeg (+ optional aria2 & rclone), drops `yosync` into `~/bin`, creates a
+sane starting config and library folders, and asks if you want the 6am background daemon on.
+Safe to run twice; nothing is overwritten. (Preview it with `SETUP_DRY_RUN=1 ./Setup.command`.)
+
+> If macOS complains on first open: right-click → **Open** → Open once, or run
+> `xattr -d com.apple.quarantine Setup.command`.
+
+### B) Manual (Linux/Windows/macOS, ~5 minutes)
+
+1. **Install the dependencies** (see table above): Python 3.10+, `yt-dlp`, `ffmpeg`. Optional: `aria2`, `rclone`.
+
+2. **Put the tool on PATH**
 
    ```sh
    chmod +x bin/yosync
    cp bin/yosync ~/bin/yosync       # or anywhere on PATH
    ```
 
-2. **Create the config** (see [`config.example.json`](config.example.json)):
+3. **Create the config** (see [`config.example.json`](config.example.json)):
 
    ```sh
    mkdir -p ~/.config/yosync
@@ -100,7 +114,7 @@ The library looks like this:
 
    Or run the interactive wizard: `python3 ~/bin/yosync --setup`
 
-3. **Export your watch history from Google Takeout**
+4. **Export your watch history from Google Takeout**
 
    - https://takeout.google.com → deselect everything
    - enable **YouTube** and **YouTube Music**, then only **Watch history**
@@ -108,7 +122,7 @@ The library looks like this:
    - file type **.zip**, **JSON** format, size **largest**
    - deliver to **Google Drive** (folder `Takeout`) if you want automatic pulls, or download manually
 
-4. **Ingest it**
+5. **Ingest it**
 
    ```sh
    # drop the zip into the library's incoming folder, then:
@@ -117,7 +131,7 @@ The library looks like this:
    python3 ~/bin/yosync
    ```
 
-5. **Enable the daily 6am daemon** (macOS, launchd):
+6. **Enable the daily 6am daemon** (macOS, launchd):
 
    ```sh
    python3 ~/bin/yosync --daemon
