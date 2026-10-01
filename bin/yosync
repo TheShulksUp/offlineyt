@@ -1509,6 +1509,94 @@ def reconcile_index(cfg, index, cache, silent):
     return added
 
 
+def _ffprobe_ok(path):
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return False
+    try:
+        return float(r.stdout.strip()) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _clean_stale_temp(dest, max_age_days=1, silent=False):
+    now = time.time()
+    removed = 0
+    for root, _dirs, files in os.walk(dest):
+        rel = os.path.relpath(root, dest)
+        if rel == "." or rel.startswith(".yosync"):
+            continue
+        for fn in files:
+            if not fn.endswith((".part", ".ytdl")):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                if now - os.path.getmtime(path) > max_age_days * 86400:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+    if removed and not silent:
+        log("removed %d stale partial download(s)" % removed)
+    return removed
+
+
+def _discard_archive(archive_lines, vid):
+    archive_lines.discard(vid)
+    archive_lines.discard("youtube " + vid)
+    archive_lines.discard("YouTube " + vid)
+
+
+def verify_media(cfg, state, silent):
+    index = state.setdefault("index", {})
+    archive = paths_in_dest(cfg["dest"])["archive"]
+    os.makedirs(os.path.dirname(archive), exist_ok=True)
+    archive_lines = set()
+    if os.path.exists(archive):
+        with open(archive) as fh:
+            archive_lines = {ln.strip() for ln in fh if ln.strip()}
+    removed = 0
+    checked = 0
+    for vid, info in list(index.items()):
+        path = info.get("path")
+        if not path or not os.path.isfile(path):
+            removed += 1
+            index.pop(vid, None)
+            _discard_archive(archive_lines, vid)
+            continue
+        checked += 1
+        ok = _ffprobe_ok(path)
+        if ok is None:
+            try:
+                ok = os.path.getsize(path) >= \
+                    cfg.get("verify_min_size_mb", 1) * 1024 * 1024
+            except OSError:
+                ok = False
+        if not ok:
+            _remove_with_sidecars(path)
+            if not silent:
+                log("removed corrupt/unreadable: %s" % os.path.basename(path))
+            index.pop(vid, None)
+            _discard_archive(archive_lines, vid)
+            removed += 1
+    added = reconcile_index(cfg, index, state.get("video_cache") or {}, silent)
+    with open(archive, "w") as fh:
+        fh.write("\n".join(a for a in archive_lines if a))
+    _clean_stale_temp(cfg["dest"], silent=silent)
+    if not silent:
+        log("verify: checked %d file(s), removed %d broken/missing, "
+            "added %d from disk" % (checked, removed, added))
+    return removed
+
+
 def _download_args(cfg, archive, audio=False):
     cmd = ["yt-dlp", "--download-archive", archive,
            "-o", os.path.join(cfg["dest"], "%(uploader)s",
@@ -1707,7 +1795,8 @@ def main():
                "  yosync --no-daemon      disable background sync\n"
                "  yosync --topup          fill hot channels toward budget now\n"
                "  yosync --quickfill      fast fill, heavy parallelism (Ctrl+C to abort)\n"
-               "  yosync --serve          open the settings page in your browser")
+               "  yosync --serve          open the settings page in your browser\n"
+               "  yosync --verify         integrity-check the library")
     ap.add_argument("--setup", action="store_true", help="run setup wizard")
     ap.add_argument("--dest", help="offline folder (default ~/Movies/OfflineYouTube)")
     ap.add_argument("--dry-run", action="store_true", help="preview only, no downloads")
@@ -1729,6 +1818,9 @@ def main():
                     help="stream yt-dlp download logs to stdout while running")
     ap.add_argument("--serve", action="store_true",
                     help="open the in-browser settings page (schema + status + help)")
+    ap.add_argument("--verify", action="store_true",
+                    help="integrity-check the library: ffprobe every indexed "
+                         "file, drop broken ones, re-scan disk, clean stale temp files")
     args = ap.parse_args()
 
     if args.ingest and (args.daemon or args.no_daemon or args.setup or args.serve):
@@ -1763,6 +1855,18 @@ def main():
 
     p = paths_in_dest(cfg["dest"])
     ensure_dirs(cfg)
+
+    if args.verify:
+        state = {}
+        if os.path.exists(p["state"]):
+            try:
+                with open(p["state"]) as fh:
+                    state = json.load(fh)
+            except ValueError:
+                state = {}
+        verify_media(cfg, state, args.silent)
+        save_state(p["state"], state)
+        return
 
     state = {}
     if os.path.exists(p["state"]):
