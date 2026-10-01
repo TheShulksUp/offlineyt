@@ -50,7 +50,7 @@ Google Takeout zip  →  ingest  →  merge history  →  attribute channels  �
 The library looks like this:
 
 ```
-~/Library/Mobile Documents/com~apple~CloudDocs/OfflineYT/
+~/Movies/OfflineYouTube/
 ├── SomeChannel/
 ├── AnotherChannel/
 ├── ThirdChannel/
