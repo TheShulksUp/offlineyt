@@ -175,6 +175,7 @@ def default_config(dest):
         "drive_path": "Takeout",
         "enrich_limit": 150,
         "daemon": False,
+        "daemon_time": "06:00",
         "exclude_channels": [],
         "ad_channel_names": [],
         "ad_keywords": [],
@@ -202,6 +203,11 @@ def load_config(silent=False):
         with open(CONFIG_PATH) as fh:
             cfg = json.load(fh)
         cfg["dest"] = os.path.expanduser(cfg["dest"])
+        # Fill in anything added since this config was written, so an existing
+        # config picks up new settings (daemon_time, ...) instead of silently
+        # missing them until the next save.
+        for key, value in default_config(cfg["dest"]).items():
+            cfg.setdefault(key, value)
         return cfg
     except (OSError, ValueError):
         log("config unreadable; run setup again", silent)
@@ -289,6 +295,8 @@ SETTINGS_SCHEMA = [
      "fields": [
          {"key": "daemon", "label": "Run a daily background sync", "type": "bool",
           "help": "Saves the setting; apply it with yosync --daemon / --no-daemon on the command line."},
+         {"key": "daemon_time", "label": "What time the daily sync runs", "type": "text",
+          "help": "24-hour HH:MM, e.g. 06:00 or 23:30. Applied the next time you run yosync --daemon."},
       ]},
     {"id": "protection", "title": "Protection & ads", "help": "Channels you never want touched, plus sponsor-block style ad cleanup for the rest.",
      "fields": [
@@ -425,6 +433,9 @@ def _apply_config_update(cfg, payload):
         coerced = _coerce_val(ft, value)
         if ft.get("type") == "text" and key == "dest" and not str(coerced).strip():
             errors.append("library folder cannot be empty")
+            continue
+        if key == "daemon_time" and parse_daemon_time(coerced) is None:
+            errors.append("daemon time must be HH:MM, 24-hour (e.g. 06:00, 23:30)")
             continue
         merged[key] = coerced
     if not merged.get("dest"):
@@ -689,7 +700,7 @@ function renderHelp(){
 <h3>Ad cleanup</h3>
 <p>Channels you watch that turned into paid-ad slots get detected and reclaimed. You can add manual bans under Protection, and any name matching an <code>ad_keyword</code> gets purged. Channels listed in <code>exclude_channels</code> are never touched.</p>
 <h3>Background sync</h3>
-<p><code>yosync --daemon</code> installs a launchd agent that syncs daily via <code>--drive --silent</code>. Toggle with <code>--no-daemon</code>. These files are set up in the raw <code>config.json</code>, but everything in this page updates them live.</p>
+<p><code>yosync --daemon</code> installs a launchd agent (macOS) or a systemd user timer (Linux) that syncs daily via <code>--drive --silent</code>. Toggle with <code>--no-daemon</code>. The time is set by <code>daemon_time</code> (24-hour HH:MM) and is applied the next time you run <code>yosync --daemon</code> — changing it here does not reschedule an already-installed agent by itself. These files are set up in the raw <code>config.json</code>, but everything in this page updates them live.</p>
 `;
 }
 function renderTrouble(){
@@ -1970,17 +1981,44 @@ def setup_wizard(cfg, args, silent):
     log("setup done. when ready, run: yosync", silent)
 
 
+def parse_daemon_time(value, default="06:00"):
+    """Parse a 24-hour HH:MM daemon time, falling back to default.
+
+    Accepts "6:00", "06:00", "23:30", "00:15". Returns (hour, minute) or None
+    if the value is unusable, so callers can fall back to the default instead
+    of writing a broken schedule.
+    """
+    if not isinstance(value, str):
+        return None
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", value)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def daemon_time_str(cfg):
+    """The configured daemon time as HH:MM, or the default if unset/invalid."""
+    parsed = parse_daemon_time(cfg.get("daemon_time"))
+    if parsed is None:
+        parsed = parse_daemon_time("06:00")
+    return "%02d:%02d" % parsed
+
+
 def write_daemon(daemon, cfg, silent):
     if daemon and _ytdlp_missing():
         log("note: yt-dlp not found; install with: brew install yt-dlp", silent)
     if sys.platform != "darwin":
         _write_daemon_linux(daemon, cfg, silent)
         return
+    when = daemon_time_str(cfg)
     plist = {
         "Label": "com.vyom.yosync",
         "ProgramArguments": [sys.executable, os.path.abspath(__file__),
                              "--drive", "--silent"],
-        "StartCalendarInterval": {"Hour": 6, "Minute": 0},
+        "StartCalendarInterval": {"Hour": int(when[:2]), "Minute": int(when[3:])},
         "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
         "StandardOutPath": os.path.join(cfg["dest"], "logs", "sync.log"),
         "StandardErrorPath": os.path.join(cfg["dest"], "logs", "sync.log"),
@@ -1993,7 +2031,7 @@ def write_daemon(daemon, cfg, silent):
         plistlib.dump(plist, fh)
     _load_daemon(silent)
     if not silent:
-        log("background sync scheduled daily at 6am")
+        log("background sync scheduled daily at %s" % daemon_time_str(cfg))
 
 
 def daemon_installed():
@@ -2002,7 +2040,7 @@ def daemon_installed():
     Asks the OS rather than trusting cfg["daemon"]: the schedule lives in the
     LaunchAgent plist / systemd timer, and those can disagree with the config
     (a config restored from a backup, a plist left behind by `yosync
-    --no-daemon`). Status should report what will actually run at 6am.
+    --no-daemon`). Status should report what will actually run and when.
     """
     if sys.platform != "darwin":
         try:
@@ -2050,18 +2088,19 @@ def _write_daemon_linux(daemon, cfg, silent):
     with open(service, "w") as fh:
         fh.write("[Unit]\nDescription=OfflineYT sync (yosync)\n\n"
                  "[Service]\nType=oneshot\nExecStart=%s\n" % cmd)
+    when = daemon_time_str(cfg)
     with open(timer, "w") as fh:
-        fh.write("[Unit]\nDescription=Run OfflineYT sync daily at 06:00\n\n"
-                 "[Timer]\nOnCalendar=*-*-* 06:00:00\nPersistent=true\n\n"
-                 "[Install]\nWantedBy=timers.target\n")
+        fh.write("[Unit]\nDescription=Run OfflineYT sync daily at %s\n\n"
+                 "[Timer]\nOnCalendar=*-*-* %s:00\nPersistent=true\n\n"
+                 "[Install]\nWantedBy=timers.target\n" % (when, when))
     _systemctl_user("daemon-reload")
     r = _systemctl_user("enable", "--now", "yosync.timer")
     if r.returncode != 0 and not silent:
         log("systemd timer install failed; add to crontab instead:",
             silent)
-        log("  0 6 * * * %s" % cmd, silent)
+        log("  %s %s * * * %s" % (when[3:], when[:2], cmd), silent)
     elif not silent:
-        log("background sync scheduled daily at 6am (systemd user timer)")
+        log("background sync scheduled daily at %s (systemd user timer)" % when)
 
 
 def _ytdlp_missing():

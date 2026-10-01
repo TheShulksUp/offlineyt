@@ -163,7 +163,7 @@ def test_daemon_status_reads_the_schedule_not_the_config(tmp_path, monkeypatch):
     import plistlib
 
     monkeypatch.setattr(y, "PLIST_PATH", str(tmp_path / "com.vyom.yosync.plist"))
-    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "darwin"}))
+    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "darwin", "executable": "/usr/bin/python3"}))
 
     cfg = y.default_config(str(tmp_path))
     cfg["daemon"] = False          # stale config flag
@@ -183,8 +183,117 @@ def test_daemon_status_reads_the_schedule_not_the_config(tmp_path, monkeypatch):
 
 def test_daemon_status_handles_a_corrupt_plist(tmp_path, monkeypatch):
     monkeypatch.setattr(y, "PLIST_PATH", str(tmp_path / "broken.plist"))
-    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "darwin"}))
+    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "darwin", "executable": "/usr/bin/python3"}))
     with open(tmp_path / "broken.plist", "wb") as fh:
         fh.write(b"not a plist at all")
     assert y.daemon_installed() is False
     assert y.daemon_next_run() is None
+
+
+# --- configurable daemon time ---------------------------------------------------
+
+def test_parse_daemon_time_accepts_valid_forms():
+    assert y.parse_daemon_time("06:00") == (6, 0)
+    assert y.parse_daemon_time("6:00") == (6, 0)
+    assert y.parse_daemon_time("23:30") == (23, 30)
+    assert y.parse_daemon_time("00:15") == (0, 15)
+    assert y.parse_daemon_time(" 07:05 ") == (7, 5)
+
+
+def test_parse_daemon_time_rejects_garbage():
+    for bad in ("", "6", "6am", "24:00", "12:60", "12:30:00", "noon",
+                None, 600, "12-30", "-1:00"):
+        assert y.parse_daemon_time(bad) is None, bad
+
+
+def test_daemon_time_str_falls_back_to_default():
+    assert y.daemon_time_str({}) == "06:00"
+    assert y.daemon_time_str({"daemon_time": "23:30"}) == "23:30"
+    assert y.daemon_time_str({"daemon_time": "nonsense"}) == "06:00"
+    assert y.daemon_time_str({"daemon_time": "24:00"}) == "06:00"
+
+
+def test_default_config_has_daemon_time():
+    cfg = y.default_config("/tmp/whatever")
+    assert cfg["daemon_time"] == "06:00"
+
+
+def test_schema_exposes_daemon_time():
+    keys = [f["key"] for g in y.SETTINGS_SCHEMA for f in g["fields"]]
+    assert "daemon_time" in keys
+
+
+def test_write_daemon_uses_configured_time(tmp_path, monkeypatch):
+    """The plist must carry the configured hour/minute, not a hardcoded 6am."""
+    import plistlib
+
+    plist_path = tmp_path / "com.vyom.yosync.plist"
+    monkeypatch.setattr(y, "PLIST_PATH", str(plist_path))
+    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "darwin", "executable": "/usr/bin/python3"}))
+    monkeypatch.setattr(y, "_load_daemon", lambda silent: None)
+    monkeypatch.setattr(y, "_unload_daemon", lambda silent: None)
+
+    cfg = y.default_config(str(tmp_path))
+    cfg["daemon_time"] = "23:30"
+    y.write_daemon(True, cfg, silent=True)
+
+    with open(plist_path, "rb") as fh:
+        when = plistlib.load(fh)["StartCalendarInterval"]
+    assert when == {"Hour": 23, "Minute": 30}, when
+
+
+def test_write_daemon_falls_back_for_bad_time(tmp_path, monkeypatch):
+    import plistlib
+
+    plist_path = tmp_path / "com.vyom.yosync.plist"
+    monkeypatch.setattr(y, "PLIST_PATH", str(plist_path))
+    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "darwin", "executable": "/usr/bin/python3"}))
+    monkeypatch.setattr(y, "_load_daemon", lambda silent: None)
+
+    cfg = y.default_config(str(tmp_path))
+    cfg["daemon_time"] = "99:99"
+    y.write_daemon(True, cfg, silent=True)
+
+    with open(plist_path, "rb") as fh:
+        when = plistlib.load(fh)["StartCalendarInterval"]
+    assert when == {"Hour": 6, "Minute": 0}, when
+
+
+def test_linux_timer_uses_configured_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(y, "HOME", str(tmp_path))
+    monkeypatch.setattr(y, "sys", type("S", (), {"platform": "linux", "executable": "/usr/bin/python3"}))
+    monkeypatch.setattr(y, "_systemctl_user", lambda *a: type("R", (), {"returncode": 0})())
+
+    cfg = y.default_config(str(tmp_path))
+    cfg["daemon_time"] = "01:45"
+    y.write_daemon(True, cfg, silent=True)
+
+    timer = (tmp_path / ".config" / "systemd" / "user" / "yosync.timer").read_text()
+    assert "OnCalendar=*-*-* 01:45:00" in timer, timer
+    assert "daily at 01:45" in timer, timer
+
+
+def test_settings_page_rejects_a_bad_daemon_time():
+    cfg = y.default_config("/tmp/whatever")
+    merged, errors = y._apply_config_update(cfg, {"daemon_time": "25:00"})
+    assert any("daemon time" in e for e in errors), errors
+    assert merged["daemon_time"] == "06:00", "bad value must not be stored"
+
+
+def test_settings_page_accepts_a_good_daemon_time():
+    cfg = y.default_config("/tmp/whatever")
+    merged, errors = y._apply_config_update(cfg, {"daemon_time": "22:15"})
+    assert errors == [], errors
+    assert merged["daemon_time"] == "22:15"
+
+
+def test_load_config_fills_in_new_settings(tmp_path, monkeypatch):
+    """A config written before a setting existed must still get the default,
+    otherwise the setting is silently absent until the next save."""
+    cfgp = tmp_path / "config.json"
+    with open(cfgp, "w") as fh:
+        json.dump({"dest": str(tmp_path), "daemon": True}, fh)
+    monkeypatch.setattr(y, "CONFIG_PATH", str(cfgp))
+    cfg = y.load_config(silent=True)
+    assert cfg["daemon_time"] == "06:00", cfg.get("daemon_time")
+    assert cfg["daemon"] is True, "existing values must be preserved"

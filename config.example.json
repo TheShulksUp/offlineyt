@@ -29,6 +29,7 @@
   "drive_path": "Takeout",
   "enrich_limit": 150,
   "daemon": false,
+  "daemon_time": "06:00",
   "exclude_channels": [],
   "ad_channel_names": [],
   "ad_keywords": [],

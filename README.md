@@ -12,7 +12,7 @@ OfflineYT solves the *"mirror what I actually watch"* problem:
 - **Continuous budgets, not limits per 100 videos** — budget scales with how much each channel means to you (≈0.17 GB per distinct video watched, clamped to 1–3.5 GB).
 - **Auto-rotation** — newest in, oldest out, so your library never grows unbounded.
 - **Ad / bot driven junk gets skipped & purged automatically** (incl. the new Google Takeout ad format).
-- **Runs itself** — a 6am background daemon keeps everything fresh.
+- **Runs itself** — a daily background daemon keeps everything fresh (time is configurable).
 
 The engine is a single-file Python tool: **[`bin/yosync`](bin/yosync)** — no services, no account, your data stays yours.
 
@@ -87,7 +87,7 @@ The library looks like this:
 
 Grab **`Setup.command`** from the repo root and double-click it. It installs Homebrew,
 Python, yt-dlp, ffmpeg (+ optional aria2 & rclone), drops `yosync` into `~/bin`, creates a
-sane starting config and library folders, and asks if you want the 6am background daemon on.
+sane starting config and library folders, and asks if you want the daily background daemon on.
 Safe to run twice; nothing is overwritten. (Preview it with `SETUP_DRY_RUN=1 ./Setup.command`.)
 
 > If macOS complains on first open: right-click → **Open** → Open once, or run
@@ -101,7 +101,8 @@ curl -fsSL https://raw.githubusercontent.com/TheShulksUp/offlineyt/main/setup.sh
 
 Installs `yt-dlp` + `ffmpeg` via your package manager, drops `yosync` in `~/.local/bin`,
 writes a starting config, and sets up a **systemd user timer** that runs the sync daily at
-6am (falls back to a crontab entry where timers aren't available).
+at the time set by <code>daemon_time</code> (24-hour HH:MM, default 06:00; falls back to a
+crontab entry where timers aren't available).
 Preview it first with `DRY_RUN=1 bash setup.sh`.
 
 ### C) Manual (Linux/Windows/macOS, ~5 minutes)
@@ -142,7 +143,7 @@ Preview it first with `DRY_RUN=1 bash setup.sh`.
    python3 ~/bin/yosync
    ```
 
-6. **Enable the daily 6am daemon**
+6. **Enable the daily daemon** (default 06:00, change with `daemon_time`)
 
    ```sh
    python3 ~/bin/yosync --daemon     # macOS: launchd · Linux: systemd user timer
@@ -194,7 +195,7 @@ Saving writes straight to `config.json`. Change the port with `settings_port`.
 The **Status** tab answers "is this thing actually working?": videos and size on disk, channels
 tracked, hot channels and their budgets, free space, ad tracking, when the last sync and ingest
 ran, and whether a background sync is really scheduled. It asks the OS about the schedule rather
-than trusting the config, so it can't tell you "off" while your 6am job is installed and running.
+than trusting the config, so it can't tell you "off" while your scheduled job is installed and running.
 
 `--serve` deliberately does *not* take the sync lock, so you can open it while a sync or a
 `--verify` is running — the page starts immediately instead of waiting its turn.
@@ -322,7 +323,7 @@ yt-dlp -f "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]" \
 | `ERROR: [youtube] ...: Sign in to confirm...` | add cookies (see above) |
 | "all channels locked" on a normal run | that's rotation doing its job — `--topup` / `--quickfill` to override |
 | channels never reach budget | they're mostly Shorts or the videos are deleted — nothing left to download |
-| nothing happens at 6am | check `logs/sync.log`; `launchctl list \| grep yosync` (macOS) or `systemctl --user list-timers \| grep yosync` (Linux) |
+| nothing happens when it should | check `logs/sync.log`; `launchctl list \| grep yosync` (macOS) or `systemctl --user list-timers \| grep yosync` (Linux) |
 | a file is corrupt or won't play | `yosync --verify` — ffprobes everything, removes broken files, re-scans disk |
 | the settings page says the port is in use | close the other tab, or change `settings_port` in the page |
 
