@@ -93,7 +93,18 @@ Safe to run twice; nothing is overwritten. (Preview it with `SETUP_DRY_RUN=1 ./S
 > If macOS complains on first open: right-click → **Open** → Open once, or run
 > `xattr -d com.apple.quarantine Setup.command`.
 
-### B) Manual (Linux/Windows/macOS, ~5 minutes)
+### B) One-liner (Linux) — recommended
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TheShulksUp/offlineyt/main/setup.sh | bash
+```
+
+Installs `yt-dlp` + `ffmpeg` via your package manager, drops `yosync` in `~/.local/bin`,
+writes a starting config, and sets up a **systemd user timer** that runs the sync daily at
+6am (falls back to a crontab entry where timers aren't available).
+Preview it first with `DRY_RUN=1 bash setup.sh`.
+
+### C) Manual (Linux/Windows/macOS, ~5 minutes)
 
 1. **Install the dependencies** (see table above): Python 3.10+, `yt-dlp`, `ffmpeg`. Optional: `aria2`, `rclone`.
 
@@ -131,13 +142,20 @@ Safe to run twice; nothing is overwritten. (Preview it with `SETUP_DRY_RUN=1 ./S
    python3 ~/bin/yosync
    ```
 
-6. **Enable the daily 6am daemon** (macOS, launchd):
+6. **Enable the daily 6am daemon**
 
    ```sh
-   python3 ~/bin/yosync --daemon
+   python3 ~/bin/yosync --daemon     # macOS: launchd · Linux: systemd user timer
    ```
 
-   (equivalent to the `com.vyom.yosync` LaunchAgent running `yosync --drive --silent`).
+   (macOS runs the `com.vyom.yosync` LaunchAgent with `yosync --drive --silent`; on Linux it
+   installs a `yosync.service` / `yosync.timer` pair under `~/.config/systemd/user`.)
+
+7. **Or skip the config file entirely**
+
+   ```sh
+   python3 ~/bin/yosync --serve     # every setting, editable in your browser
+   ```
 
 ---
 
@@ -159,6 +177,34 @@ Quickfill one-liner used in production:
 ```sh
 python3 ~/bin/yosync --quickfill --logs
 ```
+
+| Flag | What it does |
+|---|---|
+| `--serve` | open the settings page: every knob, live status, help & troubleshooting |
+| `--verify` | integrity-check the library: ffprobe each file, drop broken ones, re-scan disk |
+| `--inbox` | only process URL files you dropped into `<library>/inbox/`, then exit |
+
+### Settings without a config file
+
+`--serve` starts a local-only web page (binds `127.0.0.1`, nothing leaves your machine)
+with every setting in the schema — budgets, per-channel overrides, audio-only channels,
+subtitles, Shorts, protection lists — plus a status panel, help and troubleshooting.
+Saving writes straight to `config.json`. Change the port with `settings_port`.
+
+### Grab things on demand
+
+Drop a file with one or more YouTube links into `<library>/inbox/`:
+
+```
+# links.txt
+https://www.youtube.com/watch?v=abcdefghijk
+@SomeChannel
+https://www.youtube.com/playlist?list=PLxxxxxxx
+```
+
+The next run (or `yosync --inbox`) grabs the video, and asks how many uploads to take from
+each channel/playlist (defaults: 50, configurable via `inbox_channel_count` /
+`inbox_playlist_count`). Processed files move to `.yosync/inbox-consumed/`.
 
 ---
 
@@ -258,17 +304,28 @@ yt-dlp -f "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]" \
 | `ERROR: [youtube] ...: Sign in to confirm...` | add cookies (see above) |
 | "all channels locked" on a normal run | that's rotation doing its job — `--topup` / `--quickfill` to override |
 | channels never reach budget | they're mostly Shorts or the videos are deleted — nothing left to download |
-| nothing happens at 6am | check `logs/sync.log`; `launchctl list \| grep yosync` |
+| nothing happens at 6am | check `logs/sync.log`; `launchctl list \| grep yosync` (macOS) or `systemctl --user list-timers \| grep yosync` (Linux) |
+| a file is corrupt or won't play | `yosync --verify` — ffprobes everything, removes broken files, re-scans disk |
+| the settings page says the port is in use | close the other tab, or change `settings_port` in the page |
 
 ---
+
+## Tests
+
+The budget math, download-argument builder, settings page and integrity check are covered
+by a pytest suite:
+
+```sh
+python3 -m pip install pytest
+python3 -m pytest tests -q
+```
 
 ## Roadmap & PRs welcome
 
 Ideas worth building next — pitch or submit one:
 
-- **Windows / Linux support** for the daemon (systemd timer instead of launchd).
 - **Watched-progress import** of the new Takeout **.csv** format.
-- **Inbox watcher** that auto-queues videos you save via a "watch for me later" shortcut.
+- **Windows daemon** (Task Scheduler) to pair with the macOS and Linux ones.
 - **Budget presets** (feather / balanced / hoarder) as a single config flag.
 - **Portable bundles** (PyInstaller) so non-technical people can skip the install.
 

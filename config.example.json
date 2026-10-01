@@ -42,5 +42,7 @@
   "audio_only_channels": [],
   "channel_budget_overrides": {},
   "verify_media": true,
-  "verify_min_size_mb": 1
+  "verify_min_size_mb": 1,
+  "inbox_channel_count": 50,
+  "inbox_playlist_count": 50
 }
