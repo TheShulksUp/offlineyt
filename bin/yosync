@@ -612,7 +612,7 @@ const $$=(s,e=document)=>[...e.querySelectorAll(s)];
 let SCHEMA=[];
 async function api(p,opts){const r=await fetch(p,opts);let j;try{j=await r.json()}catch(_){j={}}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function toast(msg,bad){const s=$('#status');if(!s)return;s.textContent=msg;s.style.color=bad?'var(--red)':'var(--green)';clearTimeout(s._t);s._t=setTimeout(()=>s.textContent='',3000)}
+function toast(msg,bad){const s=$('#status');if(!s)return;s.textContent=msg;s.style.color=bad?'var(--red)':'var(--green)';clearTimeout(s._t);s._t=setTimeout(()=>s.textContent='',5000)}
 
 function renderSettings(){
  const root=$('#view');root.innerHTML='';
