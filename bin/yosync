@@ -2223,9 +2223,11 @@ def main():
         if not args.dry_run:
             resolve_ad_videos(state, cfg, args.silent)
         channels = analyze(cfg, state.get("history", []), now)
-        purge_ad_channels(cfg, channels, state.setdefault("index", {}),
-                          args.silent, state)
-        purge_ad_videos(cfg, state.setdefault("index", {}), args.silent, state)
+        # a dry run must never delete anything
+        if not args.dry_run:
+            purge_ad_channels(cfg, channels, state.setdefault("index", {}),
+                              args.silent, state)
+            purge_ad_videos(cfg, state.setdefault("index", {}), args.silent, state)
 
         if args.silent:
             logfile = p["logfile"]

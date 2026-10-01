@@ -105,3 +105,66 @@ def test_resolve_respects_limit_and_skips_resolved(monkeypatch):
     assert seen[1] == ["a1"]
     y.resolve_ad_videos(state, cfg, True)
     assert len(seen) == 2, "everything resolved -> no more yt-dlp calls"
+
+
+def _run_main(monkeypatch, dest, state, extra_argv):
+    """Invoke main() end-to-end with the network and downloads stubbed out."""
+    import sys
+    for name in ("enrich_channels", "download", "report", "rclone_pull",
+                 "resolve_ad_videos", "inbox_download"):
+        monkeypatch.setattr(y, name, lambda *a, **k: None)
+    cfg = y.default_config(dest)
+    cfg["ad_channel_names"] = []
+    cfg["min_watches"] = 1
+    cfgp = os.path.join(dest, "config.json")
+    with open(cfgp, "w") as fh:
+        json.dump(cfg, fh)
+    monkeypatch.setattr(y, "CONFIG_PATH", cfgp)
+    meta = os.path.join(dest, ".yosync")
+    os.makedirs(meta, exist_ok=True)
+    statepath = os.path.join(meta, "state.json")
+    with open(statepath, "w") as fh:
+        json.dump(state, fh)
+    monkeypatch.setattr(sys, "argv", ["yosync", "--dest", dest] + extra_argv)
+    y.main()
+    with open(statepath) as fh:
+        return json.load(fh)
+
+
+def test_dry_run_never_deletes_ad_served_files(monkeypatch, tmp_path):
+    """--dry-run is a preview: it must not touch the library, ads or not."""
+    dest = str(tmp_path)
+    f = os.path.join(dest, "Advertiser", "Ad [hhhhhhhhhhh].mp4")
+    os.makedirs(os.path.dirname(f))
+    open(f, "w").close()
+    state = {
+        "ad_landings": {"advertiser": "Advertiser"},
+        "ad_videos": {"hhhhhhhhhhh": "2026-09-25T23:00:00Z"},
+        "history": [{"id": "hhhhhhhhhhh", "title": "Ad",
+                     "time": "2026-09-25T23:00:00+00:00",
+                     "channel": "Advertiser",
+                     "channel_url": "https://www.youtube.com/channel/uc_adv"}],
+        "index": {"hhhhhhhhhhh": {"name": "Advertiser", "channel": "uc_adv",
+                                  "path": f, "t": "2026-09-25"}},
+    }
+    out = _run_main(monkeypatch, dest, state, ["--dry-run"])
+    assert os.path.exists(f), "dry run deleted a file"
+    assert "hhhhhhhhhhh" in out["index"]
+
+
+def test_dry_run_never_deletes_banned_channel_files(monkeypatch, tmp_path):
+    dest = str(tmp_path)
+    f = os.path.join(dest, "Banned", "Vid [iiiiiiiiiii].mp4")
+    os.makedirs(os.path.dirname(f))
+    open(f, "w").close()
+    state = {
+        "ad_landings": {"banned": "Banned"},
+        "history": [{"id": "iiiiiiiiiii", "title": "Vid",
+                     "time": "2026-09-25T23:00:00+00:00", "channel": "Banned",
+                     "channel_url": "https://www.youtube.com/channel/uc_ban"}],
+        "index": {"iiiiiiiiiii": {"name": "Banned", "channel": "uc_ban",
+                                  "path": f, "t": "2026-09-25"}},
+    }
+    out = _run_main(monkeypatch, dest, state, ["--dry-run"])
+    assert os.path.exists(f), "dry run deleted a banned-channel file"
+    assert "iiiiiiiiiii" in out["index"]
