@@ -87,7 +87,7 @@ def test_other_runs_still_take_the_sync_lock(tmp_path, monkeypatch):
     assert acquired == [1], "a dry run must still take the sync lock"
 
 
-def test_status_payload_reports_the_interesting_numbers(tmp_path):
+def test_status_payload_reports_the_interesting_numbers(tmp_path, monkeypatch):
     """Status is only useful if it carries library/sync/ad state, not just
     last_run."""
     dest = tmp_path / "lib"
@@ -110,6 +110,10 @@ def test_status_payload_reports_the_interesting_numbers(tmp_path):
 
     cfg = y.default_config(str(dest))
     cfg["daemon"] = True
+    # daemon status comes from the OS, not the config, so pin it here and let
+    # the dedicated test below cover the real detection
+    monkeypatch.setattr(y, "daemon_installed", lambda: True)
+    monkeypatch.setattr(y, "daemon_next_run", lambda: "daily 06:00")
     payload = y._state_payload(cfg)
 
     assert payload["index"] == 1
