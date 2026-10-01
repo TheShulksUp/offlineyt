@@ -186,10 +186,18 @@ python3 ~/bin/yosync --quickfill --logs
 
 ### Settings without a config file
 
-`--serve` starts a local-only web page (binds `127.0.0.1`, nothing leaves your machine)
+`yosync --serve` starts a local-only web page (binds `127.0.0.1`, nothing leaves your machine)
 with every setting in the schema — budgets, per-channel overrides, audio-only channels,
 subtitles, Shorts, protection lists — plus a status panel, help and troubleshooting.
 Saving writes straight to `config.json`. Change the port with `settings_port`.
+
+The **Status** tab answers "is this thing actually working?": videos and size on disk, channels
+tracked, hot channels and their budgets, free space, ad tracking, when the last sync and ingest
+ran, and whether a background sync is really scheduled. It asks the OS about the schedule rather
+than trusting the config, so it can't tell you "off" while your 6am job is installed and running.
+
+`--serve` deliberately does *not* take the sync lock, so you can open it while a sync or a
+`--verify` is running — the page starts immediately instead of waiting its turn.
 
 ### Grab things on demand
 
