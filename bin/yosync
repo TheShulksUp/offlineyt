@@ -1111,25 +1111,63 @@ def resolve_ad_videos(state, cfg, silent):
 
 
 def purge_ad_channels(cfg, channels, index, silent, state):
-    bans = {}
-    for ident, name in (state or {}).get("ad_landings", {}).items():
-        bans.setdefault(ident.lower(), name)
-    for name in cfg.get("ad_channel_names", []):
-        bans.setdefault(str(name).lower(), name)
+    """Purge advertiser channels, but never one the user actually watches.
+
+    Ad detection is an inference: a channel that served you an ad is not
+    necessarily a channel you want. It very often is -- a big brand runs both
+    ads and videos you watch on purpose. Deleting a channel by name then takes
+    real content with it, so an inferred ban (ad_landings / ad_keywords) is
+    only allowed to touch channels with no organic watch history at all.
+
+    ad_channel_names stays authoritative: if you name a channel there you mean
+    it, so it is honoured even against organic history.
+    """
+    state = state or {}
+    explicit = {str(n).lower() for n in cfg.get("ad_channel_names", []) if n}
+    inferred = {}
+    for ident, name in (state.get("ad_landings") or {}).items():
+        inferred.setdefault(str(ident).lower(), name)
     ad_kw = [str(k).lower() for k in cfg.get("ad_keywords", []) if k]
     excluded = {c.lower() for c in cfg.get("exclude_channels", [])}
 
+    # watching something on purpose is a stronger signal than being shown an ad
+    organic_urls = set()
+    organic_names = set()
+    for r in (state.get("history") or []):
+        u = r.get("channel_url")
+        if u:
+            organic_urls.add(str(u).lower().rstrip("/"))
+        if r.get("channel"):
+            organic_names.add(str(r["channel"]).strip().lower())
+
+    def _organic(name, key, url):
+        for cand in ((url or "").lower().rstrip("/"),
+                     (key or "").lower().rstrip("/")):
+            if not cand:
+                continue
+            if cand in organic_urls:
+                return True
+            for o in organic_urls:
+                if o.endswith("/" + cand):
+                    return True
+        return (name or "").strip().lower() in organic_names
+
     doomed = collections.OrderedDict()
+    spared = collections.OrderedDict()
 
     def _hit(name, key, url):
         n = (name or "").lower()
         if n in excluded:
             return False
-        if n in bans or (key or "").lower() in bans or (url or "").lower() in bans:
-            return True
-        if ad_kw:
-            return any(w in n for w in ad_kw)
-        return False
+        hit_inferred = (n in inferred or (key or "").lower() in inferred
+                        or (url or "").lower() in inferred
+                        or bool(ad_kw) and any(w in n for w in ad_kw))
+        if not hit_inferred and n not in explicit:
+            return False
+        if hit_inferred and n not in explicit and _organic(name, key, url):
+            spared.setdefault(key or name or "?", name or "?")
+            return False
+        return True
 
     for key, ch in channels.items():
         if _hit(ch.get("name"), ch.get("key"), ch.get("url")):
@@ -1138,6 +1176,9 @@ def purge_ad_channels(cfg, channels, index, silent, state):
         if _hit(info.get("name"), info.get("channel"), None):
             doomed.setdefault(info.get("channel"), info.get("name") or "?")
 
+    if spared and not silent:
+        log("kept %d watched channel(s) despite ad exposure: %s" %
+            (len(spared), ", ".join(sorted(set(spared.values())))))
     if not doomed:
         return 0
     removed = 0
@@ -1155,14 +1196,15 @@ def purge_ad_channels(cfg, channels, index, silent, state):
             index.pop(vid, None)
         channels.pop(key, None)
     _clean_empty_dirs(cfg["dest"])
-    add_excl = [n for n in sorted(set(doomed.values())) if n
-                and n.lower() not in excluded]
-    if add_excl:
-        cfg.setdefault("exclude_channels", []).extend(add_excl)
-        save_config(cfg)
+    # record the purge for reporting only. Writing these into exclude_channels
+    # would silently stop the user ever downloading those channels again.
+    purged = state.setdefault("ad_purged_channels", [])
+    for name in sorted(set(doomed.values())):
+        if name and name not in purged:
+            purged.append(name)
     if not silent:
         log("purged %d ad channel(s), %d file(s): %s" %
-            (len(doomed), removed, ", ".join(add_excl or sorted(set(doomed.values())))))
+            (len(doomed), removed, ", ".join(sorted(set(doomed.values())))))
     return removed
 
 
