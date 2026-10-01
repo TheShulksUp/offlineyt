@@ -236,6 +236,8 @@ each channel/playlist (defaults: 50, configurable via `inbox_channel_count` /
 | `pack_margin` | `0.92` | keep this fraction of budget headroom per download pack |
 | `quickfill_*` | see example | parallelism, margins, aria2, cookie source |
 | `settings_port` | `8765` | localhost port for the `--serve` settings page |
+| `daemon` | `false` | run a daily background sync (launchd / systemd) |
+| `daemon_time` | `06:00` | what time the daily sync runs, 24-hour HH:MM |
 
 > All of these (and everything else) can be edited from the in-browser settings page: **`yosync --serve`** — no JSON editing required.
 
