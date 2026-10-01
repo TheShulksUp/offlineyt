@@ -11,11 +11,19 @@ YOSYNC = os.path.join(ROOT, "bin", "yosync")
 
 
 def load_yosync():
-    """Import bin/yosync (extensionless) as a module without running main()."""
+    """Import bin/yosync (extensionless) as a module without running main().
+
+    CONFIG_PATH is redirected to a throwaway directory. A test only has to
+    override cfg["dest"] to get an isolated library, and anything that writes
+    config (the setup wizard, the settings page, main()) lands in the temp
+    file -- never in the developer's real ~/.config/yosync/config.json.
+    """
     loader = importlib.machinery.SourceFileLoader("yosync", YOSYNC)
     spec = importlib.util.spec_from_loader("yosync", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    mod.CONFIG_DIR = tempfile.mkdtemp(prefix="yosync-cfg-")
+    mod.CONFIG_PATH = os.path.join(mod.CONFIG_DIR, "config.json")
     return mod
 
 
