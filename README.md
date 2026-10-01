@@ -270,8 +270,12 @@ Ads that sneak into watch history are handled automatically:
 - Ad-served videos are purged **by video id**, not by channel: a channel you genuinely watch can
   also serve you an ad, and a video you watched on purpose is never deleted. A video must be
   ad-served *and* never watched organically before it goes.
-- Channels listed in `ad_channel_names` (by name) are purged wholesale — only use that for channels
-  you never actually want.
+- **A channel you actually watch is never auto-purged**, even if it served you an ad. Plenty of
+  channels run both, and ad records name no channel at all, so every advertiser becomes a
+  candidate; an inferred ban is only ever allowed to touch a channel with no organic watch
+  history (matched by channel URL, since display names collide).
+- Channels listed in `ad_channel_names` are purged wholesale, even against organic history —
+  naming one there is explicit intent. Only use that for channels you never actually want.
 
 Manual overrides in config:
 
