@@ -32,6 +32,7 @@
   "exclude_channels": [],
   "ad_channel_names": [],
   "ad_keywords": [],
+  "ad_resolve_limit": 40,
   "pack_margin": 0.92,
   "stale_grace_days": 30,
   "takeout_nag": true,

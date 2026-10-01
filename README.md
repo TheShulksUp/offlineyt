@@ -264,8 +264,14 @@ Then in config:
 Ads that sneak into watch history are handled automatically:
 
 - Records tagged **"From Google Ads"**, plus non-YouTube landing URLs, are never merged into your history.
-- The ad's channel name/URL/host is recorded in `state.json → ad_landings`.
-- Every run (daemon included) checks all channels against that ban list — any match **deletes its files immediately** and permanently excludes the name.
+- **Newer Takeout exports carry no channel name for ads** — only the watched video. yosync keeps
+  those video ids in `state.json → ad_videos` and looks the channels up with yt-dlp
+  (`ad_resolve_limit` per run), recording them in `ad_landings`.
+- Ad-served videos are purged **by video id**, not by channel: a channel you genuinely watch can
+  also serve you an ad, and a video you watched on purpose is never deleted. A video must be
+  ad-served *and* never watched organically before it goes.
+- Channels listed in `ad_channel_names` (by name) are purged wholesale — only use that for channels
+  you never actually want.
 
 Manual overrides in config:
 

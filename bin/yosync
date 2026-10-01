@@ -178,6 +178,7 @@ def default_config(dest):
         "exclude_channels": [],
         "ad_channel_names": [],
         "ad_keywords": [],
+        "ad_resolve_limit": 40,
         "pack_margin": 0.92,
         "stale_grace_days": 30,
         "takeout_nag": True,
@@ -296,6 +297,8 @@ SETTINGS_SCHEMA = [
         {"key": "ad_channel_names", "label": "Banned ad channels", "type": "list"},
         {"key": "ad_keywords", "label": "Ad keywords", "type": "list",
          "help": "Channels whose name contains any keyword get purged from the library."},
+        {"key": "ad_resolve_limit", "label": "Ad channels resolved per run", "type": "number", "min": 1, "max": 500, "step": 10,
+         "help": "How many ad-watched videos to look up via yt-dlp each run, so their channel can be banned."},
      ]},
     {"id": "verification", "title": "Verification", "help": "Post-download integrity checks for a trustworthy library.",
      "fields": [
@@ -763,7 +766,7 @@ def rclone_pull(cfg, silent=False):
     return True
 
 
-def load_watch_history(path, silent=False, ads=None):
+def load_watch_history(path, silent=False, ads=None, ad_videos=None):
     log("parsing %s" % os.path.basename(path), silent)
     if path.endswith(".zip"):
         with zipfile.ZipFile(path) as zf:
@@ -775,16 +778,16 @@ def load_watch_history(path, silent=False, ads=None):
             for n in j:
                 with zf.open(n) as fh:
                     data = json.load(fh)
-                return records_from_json(data, ads=ads)
+                return records_from_json(data, ads=ads, ad_videos=ad_videos)
             with zf.open(h[0]) as fh:
                 text = fh.read().decode("utf-8", errors="replace")
-            return records_from_html(text, ads=ads)
+            return records_from_html(text, ads=ads, ad_videos=ad_videos)
     if path.endswith(".html"):
         with open(path, encoding="utf-8", errors="replace") as fh:
-            return records_from_html(fh.read(), ads=ads)
+            return records_from_html(fh.read(), ads=ads, ad_videos=ad_videos)
     with open(path) as fh:
         data = json.load(fh)
-    return records_from_json(data, ads=ads)
+    return records_from_json(data, ads=ads, ad_videos=ad_videos)
 
 
 def _ad_identifiers(e):
@@ -806,13 +809,26 @@ def _ad_identifiers(e):
     return out
 
 
-def records_from_json(entries, ads=None):
+def _ad_video_id(e):
+    """Video id of an ad record, for the new format that carries no channel."""
+    rid = extract_video_id(e.get("titleUrl"))
+    if not rid:
+        rid = extract_video_id(e.get("title"))
+    return rid
+
+
+def records_from_json(entries, ads=None, ad_videos=None):
     records = []
     for e in entries:
         if any((d or {}).get("name") == "From Google Ads"
                for d in (e.get("details") or [])):
             if ads is not None:
-                ads.update(_ad_identifiers(e))
+                found = _ad_identifiers(e)
+                ads.update(found)
+                if not found and ad_videos is not None:
+                    rid = _ad_video_id(e)
+                    if rid:
+                        ad_videos[rid] = e.get("time") or ""
             continue
         rid = extract_video_id(e.get("titleUrl"))
         if not rid:
@@ -847,12 +863,19 @@ def records_from_json(entries, ads=None):
     return records
 
 
-def records_from_html(text, ads=None):
+def records_from_html(text, ads=None, ad_videos=None):
     records = []
     pat = re.compile(
         r"Watched\shttps?://(?:www\.)?youtube\.com/(?:watch\?v=|shorts/)"
         r"([A-Za-z0-9_-]{11}).*?"
         r"([A-Z][a-z]{2}\s\d{1,2},\s\d{4},\s\d{1,2}:\d{2}:\d{2}\s[AP]M)")
+    ad_pat = re.compile(
+        r"From Google Ads[^<]*</div>[\s\S]{0,200}?"
+        r"Watched\shttps?://(?:www\.)?youtube\.com/(?:watch\?v=|shorts/)"
+        r"([A-Za-z0-9_-]{11})")
+    if ad_videos is not None:
+        for m in ad_pat.finditer(text):
+            ad_videos.setdefault(m.group(1), "")
     for m in pat.finditer(text):
         tstr = m.group(2).replace("\u202f", " ").replace("\xa0", " ")
         try:
@@ -1010,6 +1033,81 @@ def enrich_channels(state, cfg, silent, quickfill=False):
         if not r.get("title") and info.get("title"):
             r["title"] = info["title"]
     return applied
+
+
+def purge_ad_videos(cfg, index, silent, state):
+    """Delete ad-served videos, not whole channels.
+
+    Newer Takeout exports tag ad watches with 'From Google Ads' and no channel
+    name, so the only reliable handle is the video id itself. A channel you
+    genuinely watch can also serve you ads, so we only remove videos that were
+    ad-served AND never watched organically.
+    """
+    ads = (state or {}).get("ad_videos")
+    if not ads:
+        return 0
+    organic = {r.get("id") for r in (state.get("history") or []) if r.get("id")}
+    removed = 0
+    for vid in list(ads):
+        if vid in organic:
+            continue
+        info = index.get(vid)
+        if not info:
+            continue
+        path = info.get("path")
+        try:
+            if path and os.path.isfile(path):
+                os.unlink(path)
+                removed += 1
+            elif path:
+                removed += 1
+        except OSError:
+            continue
+        index.pop(vid, None)
+    if removed and not silent:
+        log("purged %d ad-served video(s)" % removed)
+    return removed
+
+
+def resolve_ad_videos(state, cfg, silent):
+    """Map ad video ids to their channels, so ad_landings can ban them.
+
+    Newer Takeout exports tag ad records with 'From Google Ads' but carry no
+    channel name or id -- only the watched video. Without this step the ad
+    channel is never learned and never purged.
+    """
+    pending = (state or {}).get("ad_videos")
+    if not pending:
+        return 0
+    landings = state.setdefault("ad_landings", {})
+    done = state.setdefault("ad_video_resolved", {})
+    todo = [vid for vid in pending if vid not in done]
+    if not todo:
+        return 0
+    todo.sort(key=lambda v: str(pending.get(v) or ""), reverse=True)
+    limit = max(1, int(cfg.get("ad_resolve_limit", 40) or 40))
+    todo = todo[:limit]
+    if not silent:
+        log("resolving %d ad channel(s) via yt-dlp" % len(todo))
+    try:
+        meta = ytdlp_batch(todo, sleep=0, timeout=90)
+    except Exception:
+        meta = {}
+    found = 0
+    for vid in todo:
+        info = meta.get(vid)
+        if not info:
+            continue
+        name, url = info.get("channel"), info.get("channel_url")
+        if name:
+            landings[name.lower()] = name
+        if url:
+            landings[url.lower()] = url
+        done[vid] = name or ""
+        found += 1
+    if not silent and found:
+        log("ad channels identified: %d" % found)
+    return found
 
 
 def purge_ad_channels(cfg, channels, index, silent, state):
@@ -2107,9 +2205,12 @@ def main():
 
     total = 0
     ads = state.setdefault("ad_landings", {})
+    ad_videos = state.setdefault("ad_videos", {})
     for f in files:
         try:
-            total += merge_history(state, load_watch_history(f, args.silent, ads=ads))
+            total += merge_history(
+                state, load_watch_history(f, args.silent, ads=ads,
+                                          ad_videos=ad_videos))
         except (ValueError, OSError, KeyError) as e:
             log("failed to parse %s: %s" % (os.path.basename(f), e), args.silent)
 
@@ -2119,9 +2220,12 @@ def main():
     now = now_utc()
     try:
         enrich_channels(state, cfg, args.silent, quickfill=args.quickfill)
+        if not args.dry_run:
+            resolve_ad_videos(state, cfg, args.silent)
         channels = analyze(cfg, state.get("history", []), now)
         purge_ad_channels(cfg, channels, state.setdefault("index", {}),
                           args.silent, state)
+        purge_ad_videos(cfg, state.setdefault("index", {}), args.silent, state)
 
         if args.silent:
             logfile = p["logfile"]
