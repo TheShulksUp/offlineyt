@@ -1750,6 +1750,9 @@ def setup_wizard(cfg, args, silent):
 def write_daemon(daemon, cfg, silent):
     if daemon and _ytdlp_missing():
         log("note: yt-dlp not found; install with: brew install yt-dlp", silent)
+    if sys.platform != "darwin":
+        _write_daemon_linux(daemon, cfg, silent)
+        return
     plist = {
         "Label": "com.vyom.yosync",
         "ProgramArguments": [sys.executable, os.path.abspath(__file__),
@@ -1768,6 +1771,37 @@ def write_daemon(daemon, cfg, silent):
     _load_daemon(silent)
     if not silent:
         log("background sync scheduled daily at 6am")
+
+
+def _systemctl_user(*args):
+    return subprocess.run(["systemctl", "--user"] + list(args),
+                          capture_output=True, text=True)
+
+
+def _write_daemon_linux(daemon, cfg, silent):
+    unit_dir = os.path.join(HOME, ".config", "systemd", "user")
+    service = os.path.join(unit_dir, "yosync.service")
+    timer = os.path.join(unit_dir, "yosync.timer")
+    if not daemon:
+        _systemctl_user("disable", "--now", "yosync.timer")
+        return
+    os.makedirs(unit_dir, exist_ok=True)
+    cmd = "%s %s --drive --silent" % (sys.executable, os.path.abspath(__file__))
+    with open(service, "w") as fh:
+        fh.write("[Unit]\nDescription=OfflineYT sync (yosync)\n\n"
+                 "[Service]\nType=oneshot\nExecStart=%s\n" % cmd)
+    with open(timer, "w") as fh:
+        fh.write("[Unit]\nDescription=Run OfflineYT sync daily at 06:00\n\n"
+                 "[Timer]\nOnCalendar=*-*-* 06:00:00\nPersistent=true\n\n"
+                 "[Install]\nWantedBy=timers.target\n")
+    _systemctl_user("daemon-reload")
+    r = _systemctl_user("enable", "--now", "yosync.timer")
+    if r.returncode != 0 and not silent:
+        log("systemd timer install failed; add to crontab instead:",
+            silent)
+        log("  0 6 * * * %s" % cmd, silent)
+    elif not silent:
+        log("background sync scheduled daily at 6am (systemd user timer)")
 
 
 def _ytdlp_missing():
@@ -1968,6 +2002,8 @@ def main():
         if not args.silent:
             log("background sync %s" %
                 ("enabled (daily 6am)" if daemon else "disabled"))
+        if not daemon and sys.platform != "darwin":
+            _write_daemon_linux(False, cfg, args.silent)
         return
 
     if args.serve:
