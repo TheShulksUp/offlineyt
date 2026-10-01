@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax check yosync
+        run: python3 -m py_compile bin/yosync
+
+      - name: Shell script syntax
+        run: |
+          bash -n setup.sh
+          bash -n Setup.command
+          if command -v shellcheck >/dev/null; then shellcheck -S error setup.sh; fi
+
+      - name: Validate example config
+        run: python3 -c "import json; json.load(open('config.example.json'))"
+
+      - name: Install pytest
+        run: python3 -m pip install --upgrade pip pytest
+
+      - name: Run test suite
+        run: python3 -m pytest tests -q
+
+      - name: CLI help renders
+        run: python3 bin/yosync --help
