@@ -650,7 +650,7 @@ function collect(){
   else out[f.key]=el.value;
  }));return out;
 }
-async function save(){try{await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});toast('Saved');SCHEMA=await api('/api/schema');renderSettings();}catch(e){toast('Error: '+e.message,true)}}
+async function save(){try{await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});SCHEMA=await api('/api/schema');renderSettings();toast('Saved');}catch(e){renderSettings();toast('Error: '+e.message,true)}}
 
 async function renderStatus(){
  const s=await api('/api/state');const root=$('#view');root.innerHTML='';
