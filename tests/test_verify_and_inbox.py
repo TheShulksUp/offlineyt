@@ -159,3 +159,69 @@ def test_inbox_targets_ignores_dotfiles():
     with open(os.path.join(inbox, ".hidden"), "w") as fh:
         fh.write("https://www.youtube.com/watch?v=abc12345678\n")
     assert y._inbox_targets(y.default_config(dest)) == []
+
+
+def _cfg_for_inbox(dest):
+    cfg = y.default_config(dest)
+    y.ensure_dirs(cfg)
+    return cfg
+
+
+def _fake_ytdlp(monkeypatch, returncode, stdout="", stderr=""):
+    def fake_run(cmd, **kwargs):
+        return type("R", (), {"returncode": returncode, "stdout": stdout,
+                              "stderr": stderr})()
+
+    monkeypatch.setattr(y.subprocess, "run", fake_run)
+
+
+def _touch(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+    return path
+
+
+def test_inbox_failure_leaves_file_for_retry(monkeypatch):
+    """A failed yt-dlp run must not consume the input file."""
+    dest = make_lib()
+    inbox = os.path.join(dest, "inbox")
+    os.makedirs(inbox)
+    src = os.path.join(inbox, "links.txt")
+    with open(src, "w") as fh:
+        fh.write("https://www.youtube.com/watch?v=abc12345678\n")
+    _fake_ytdlp(monkeypatch, 1)
+    y.inbox_download(_cfg_for_inbox(dest), True, {})
+    assert os.path.exists(src)
+    assert not os.path.exists(os.path.join(dest, ".yosync", "inbox-consumed", "links.txt"))
+
+
+def test_inbox_indexes_destination_from_yt_dlp_log(monkeypatch):
+    """yt-dlp writes progress to stderr; the path must still be indexed."""
+    dest = make_lib()
+    inbox = os.path.join(dest, "inbox")
+    os.makedirs(inbox)
+    src = os.path.join(inbox, "links.txt")
+    with open(src, "w") as fh:
+        fh.write("https://www.youtube.com/watch?v=abc12345678\n")
+    out = _touch(os.path.join(dest, "Chan", "Title [abc12345678].mp4"))
+    _fake_ytdlp(monkeypatch, 0,
+                stderr="[download] Destination: %s\n" % out)
+    state = {"index": {}}
+    n = y.inbox_download(_cfg_for_inbox(dest), True, state)
+    assert n == 1
+    assert state["index"]["abc12345678"]["path"] == out
+    assert not os.path.exists(src)
+    assert os.path.exists(os.path.join(dest, ".yosync", "inbox-consumed", "links.txt"))
+
+
+def test_inbox_ignores_non_existent_destination(monkeypatch):
+    dest = make_lib()
+    inbox = os.path.join(dest, "inbox")
+    os.makedirs(inbox)
+    with open(os.path.join(inbox, "links.txt"), "w") as fh:
+        fh.write("https://www.youtube.com/watch?v=abc12345678\n")
+    ghost = os.path.join(dest, "Chan", "Gone [abc12345678].mp4")
+    _fake_ytdlp(monkeypatch, 0, "[download] Destination: %s\n" % ghost)
+    state = {"index": {}}
+    assert y.inbox_download(_cfg_for_inbox(dest), True, state) == 0
+    assert state["index"] == {}

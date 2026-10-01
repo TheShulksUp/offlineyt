@@ -234,6 +234,8 @@ SETTINGS_SCHEMA = [
          "help": "Used when no tier matches and budget_per_video is 0."},
         {"key": "channel_budget_overrides", "label": "Per-channel budgets", "type": "map",
          "help": "Channel name or URL = GB, one per line (never clamped). Example: SomeTechChannel = 6.0"},
+        {"key": "budget_tiers", "label": "Stepped budget tiers", "type": "tiers",
+         "help": "min_watches, GB — one per line, used instead of the continuous formula when budget_per_video is 0. Example: 10, 2.0"},
         {"key": "hot_weeks", "label": "Hot window (weeks)", "type": "number", "min": 1, "step": 1,
          "help": "Hot = distinct videos watched in the last N weeks."},
         {"key": "hot_min_watches", "label": "Distinct videos to count as hot", "type": "number", "min": 1, "step": 1},
@@ -281,7 +283,12 @@ SETTINGS_SCHEMA = [
         {"key": "keyword_min_len", "label": "Keyword minimum length", "type": "number", "min": 1, "step": 1},
         {"key": "keyword_topn", "label": "Keyword top-N per channel", "type": "number", "min": 1, "step": 1},
         {"key": "takeout_nag", "label": "Remind me to renew Takeout exports", "type": "bool"},
-     ]},
+      ]},
+    {"id": "background", "title": "Background sync", "help": "How the daily sync keeps itself running on this machine.",
+     "fields": [
+         {"key": "daemon", "label": "Run a daily background sync", "type": "bool",
+          "help": "Saves the setting; apply it with yosync --daemon / --no-daemon on the command line."},
+      ]},
     {"id": "protection", "title": "Protection & ads", "help": "Channels you never want touched, plus sponsor-block style ad cleanup for the rest.",
      "fields": [
         {"key": "exclude_channels", "label": "Protected channels", "type": "list",
@@ -364,6 +371,32 @@ def _coerce_val(ft, value):
             except (TypeError, ValueError):
                 continue
         return out
+    if t == "tiers":
+        out = []
+        if isinstance(value, str):
+            rows = [ln for ln in value.splitlines() if ln.strip()]
+        else:
+            rows = []
+            for row in (value or []):
+                if isinstance(row, dict):
+                    rows.append("%s, %s" % (row.get("min_watches"), row.get("gb")))
+                else:
+                    rows.append(str(row))
+        for ln in rows:
+            if "," in ln:
+                mw, gb = ln.split(",", 1)
+            else:
+                parts = ln.split()
+                if len(parts) < 2:
+                    continue
+                mw, gb = parts[0], parts[1]
+            try:
+                out.append({"min_watches": int(float(mw.strip())),
+                            "gb": float(gb.strip())})
+            except (TypeError, ValueError):
+                continue
+        out.sort(key=lambda t: t["min_watches"])
+        return out
     return value
 
 
@@ -405,6 +438,7 @@ def _state_payload(cfg):
     except (OSError, ValueError):
         pass
     hot = []
+    overrides = cfg.get("channel_budget_overrides") or {}
     try:
         channels = analyze(cfg, state.get("history") or [], now_utc())
         for ch in sorted((c for c in channels.values() if c.get("hot")),
@@ -415,10 +449,7 @@ def _state_payload(cfg):
                 "budget_gb": round(channel_budget(cfg, ch) / 1e9, 2),
                 "distinct": ch.get("distinct"),
                 "audio": _is_audio_channel(cfg, ch),
-                "override": bool(cfg.get("channel_budget_overrides") or {}).__class__ and
-                            (ch.get("name") in (cfg.get("channel_budget_overrides") or {}) or
-                             ch.get("key") in (cfg.get("channel_budget_overrides") or {}) or
-                             ch.get("url") in (cfg.get("channel_budget_overrides") or {})),
+                "override": bool({ch.get("name"), ch.get("key"), ch.get("url")} & set(overrides)),
             })
     except Exception:
         pass
@@ -579,7 +610,8 @@ function renderSettings(){
    if(f.type==='bool')ctl='<input type="checkbox" id="'+id+'" '+(f.value?'checked':'')+'>';
    else if(f.type==='number')ctl='<input type="number" id="'+id+'" value="'+esc(f.value)+'" min="'+(f.min??'')+'" max="'+(f.max??'')+'" step="'+(f.step??'any')+'">';
    else if(f.type==='list')ctl='<textarea id="'+id+'" placeholder="one per line">'+esc((f.value||[]).join('\n'))+'</textarea>';
-   else if(f.type==='map')ctl='<textarea id="'+id+'" placeholder="Channel Name = 5.0">'+esc(Object.entries(f.value||{}).map(([k,v])=>k+' = '+v).join('\n'))+'</textarea>';
+    else if(f.type==='map')ctl='<textarea id="'+id+'" placeholder="Channel Name = 5.0">'+esc(Object.entries(f.value||{}).map(([k,v])=>k+' = '+v).join('\n'))+'</textarea>';
+    else if(f.type==='tiers')ctl='<textarea id="'+id+'" placeholder="10, 2.0">'+esc((f.value||[]).map(t=>t.min_watches+', '+t.gb).join('\n'))+'</textarea>';
    else ctl='<input type="text" id="'+id+'" value="'+esc(f.value)+'">';
    row.innerHTML='<label for="'+id+'">'+esc(f.label)+'</label><div>'+ctl+(f.help?'<div class="help">'+esc(f.help)+'</div>':'')+'</div>';
    gr.appendChild(row);
@@ -596,7 +628,8 @@ function collect(){
   const el=document.getElementById('f_'+f.key);if(!el)return;
   if(f.type==='bool')out[f.key]=el.checked;
   else if(f.type==='list')out[f.key]=el.value.split('\n').map(s=>s.trim()).filter(Boolean);
-  else if(f.type==='map'){const m={};el.value.split('\n').forEach(ln=>{if(ln.includes('=')){const[k,v]=ln.split(/=(.*)/s).map(s=>s.trim());const n=parseFloat(v);if(k&&!isNaN(n))m[k]=n}});out[f.key]=m;}
+   else if(f.type==='map'){const m={};el.value.split('\n').forEach(ln=>{if(ln.includes('=')){const[k,v]=ln.split(/=(.*)/s).map(s=>s.trim());const n=parseFloat(v);if(k&&!isNaN(n))m[k]=n}});out[f.key]=m;}
+   else if(f.type==='tiers'){const a=[];el.value.split('\n').forEach(ln=>{const p=ln.split(/[,\s]+/).filter(Boolean);if(p.length>=2){const w=parseFloat(p[0]),g=parseFloat(p[1]);if(!isNaN(w)&&!isNaN(g))a.push({min_watches:w,gb:g})}});out[f.key]=a;}
   else if(f.type==='number'){const n=parseFloat(el.value);out[f.key]=isNaN(n)?0:n;}
   else out[f.key]=el.value;
  }));return out;
@@ -1908,17 +1941,28 @@ def inbox_download(cfg, silent, state=None):
         except OSError as e:
             log("inbox: download failed: %s" % e, silent)
             continue
-        for line in (r.stdout or "").splitlines():
-            line = line.strip()
-            if os.sep not in line or line.startswith("["):
-                continue
-            m = re.search(r"\[([A-Za-z0-9_-]{11})\](?:\.\w+)?$", line)
-            if m:
+        if r.returncode != 0:
+            log("inbox: yt-dlp exited %d for %s — left in the inbox to retry"
+                % (r.returncode, url), silent)
+            continue
+        for stream in ((r.stdout or ""), (r.stderr or "")):
+            for line in stream.splitlines():
+                line = line.strip()
+                m = re.search(r"\[([A-Za-z0-9_-]{11})\]\.[A-Za-z0-9]+$", line)
+                if not m:
+                    continue
+                tag = line.find("] ")
+                start = line.find(os.sep, 0 if tag < 0 else tag)
+                if start < 0 or start > m.start():
+                    continue
+                path = line[start:].strip().strip('"')
+                if not os.path.isfile(path):
+                    continue
                 if state is not None:
                     state.setdefault("index", {})[m.group(1)] = {
                         "channel": "inbox",
                         "name": "inbox",
-                        "path": line,
+                        "path": path,
                         "t": now_utc().isoformat(),
                     }
                 total += 1
