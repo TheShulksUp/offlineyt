@@ -189,6 +189,8 @@ def default_config(dest):
         "channel_budget_overrides": {},
         "verify_media": True,
         "verify_min_size_mb": 1,
+        "inbox_channel_count": 50,
+        "inbox_playlist_count": 50,
     }
 
 
@@ -252,6 +254,12 @@ SETTINGS_SCHEMA = [
          "help": "Channel names or URLs, one per line. Downloaded as audio for podcast-style listening."},
         {"key": "max_height", "label": "Max video height (px)", "type": "number", "min": 0, "step": 1},
         {"key": "recent_uploads", "label": "Recent uploads scanned per channel", "type": "number", "min": 1, "step": 1},
+     ]},
+    {"id": "inbox", "title": "Inbox watch", "help": "Drop a .txt/.url/.md file with a YouTube URL (video, channel or playlist) into <library>/inbox/ and yosync grabs it on the next run.",
+     "fields": [
+        {"key": "inbox_channel_count", "label": "Default videos per channel URL", "type": "number", "min": 1, "step": 1,
+         "help": "Used headlessly; interactively it asks you instead."},
+        {"key": "inbox_playlist_count", "label": "Default videos per playlist URL", "type": "number", "min": 1, "step": 1},
      ]},
     {"id": "quickfill", "title": "QuickFill", "help": "Settings for the dedicated fast-fill pass (--quickfill): parallel workers, aria2, and cookies.",
      "fields": [
@@ -1783,6 +1791,116 @@ def _unload_daemon(silent):
         pass
 
 
+INBOX_URL_RE = re.compile(
+    r"(https?://(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[^\s<>\"'\)]+"
+    r"|@[A-Za-z0-9_.-]+)")
+
+
+def _url_kind(url):
+    if "list=" in url or "/playlist" in url:
+        return "playlist"
+    if "/channel/" in url or "/c/" in url or "/user/" in url or "@" in url:
+        return "channel"
+    return "video"
+
+
+def _inbox_targets(cfg):
+    inbox = paths_in_dest(cfg["dest"])["inbox"]
+    targets = []
+    if not os.path.isdir(inbox):
+        return targets
+    for fn in sorted(os.listdir(inbox)):
+        if not fn.lower().endswith((".txt", ".url", ".md", ".desktop")):
+            continue
+        if fn.startswith("."):
+            continue
+        path = os.path.join(inbox, fn)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            for m in INBOX_URL_RE.finditer(raw):
+                url = m.group(1).rstrip(".,;:")
+                if url.startswith("@"):
+                    url = "https://www.youtube.com/" + url
+                targets.append({"file": path, "url": url})
+    return targets
+
+
+def inbox_download(cfg, silent, state=None):
+    targets = _inbox_targets(cfg)
+    if not targets:
+        return 0
+    p = paths_in_dest(cfg["dest"])
+    archive = p["archive"]
+    if not os.path.exists(archive):
+        open(archive, "w").close()
+    if not silent:
+        log("inbox: %d url target(s) found" % len(targets))
+    done_dir = os.path.join(p["state_dir"], "inbox-consumed")
+    os.makedirs(done_dir, exist_ok=True)
+    processed = set()
+    total = 0
+    for t in targets:
+        url = t["url"]
+        kind = _url_kind(url)
+        if kind == "video":
+            n = 1
+        elif kind == "playlist":
+            n = int(cfg.get("inbox_playlist_count", 50) or 1)
+        else:
+            n = int(cfg.get("inbox_channel_count", 50) or 1)
+        if not silent and kind != "video":
+            try:
+                ans = input("  %s (%s) — how many? [%d]: " % (url, kind, n)).strip()
+                if ans:
+                    n = int(ans)
+            except (EOFError, ValueError):
+                pass
+        if not silent and n > 0:
+            log("  inbox: grabbing %d video(s) from %s" % (n, url))
+        if n <= 0:
+            processed.add(t["file"])
+            continue
+        cmd = _download_args(cfg, archive)
+        cmd += ["-y", "--no-mtime"]
+        if kind != "video":
+            cmd += ["--yes-playlist", "--playlist-end", str(n)]
+        cmd.append(url)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as e:
+            log("inbox: download failed: %s" % e, silent)
+            continue
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if os.sep not in line or line.startswith("["):
+                continue
+            m = re.search(r"\[([A-Za-z0-9_-]{11})\](?:\.\w+)?$", line)
+            if m:
+                if state is not None:
+                    state.setdefault("index", {})[m.group(1)] = {
+                        "channel": "inbox",
+                        "name": "inbox",
+                        "path": line,
+                        "t": now_utc().isoformat(),
+                    }
+                total += 1
+        processed.add(t["file"])
+    for src in processed:
+        try:
+            shutil.move(src, os.path.join(
+                done_dir, os.path.basename(src)))
+        except (OSError, shutil.Error):
+            pass
+    if not silent:
+        log("inbox: done (%d file(s), %d inbox file(s) consumed)" %
+            (total, len(processed)))
+    return total
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="yosync",
@@ -1821,6 +1939,9 @@ def main():
     ap.add_argument("--verify", action="store_true",
                     help="integrity-check the library: ffprobe every indexed "
                          "file, drop broken ones, re-scan disk, clean stale temp files")
+    ap.add_argument("--inbox", action="store_true",
+                    help="only process URL files dropped into <library>/inbox/, "
+                         "then exit")
     args = ap.parse_args()
 
     if args.ingest and (args.daemon or args.no_daemon or args.setup or args.serve):
@@ -1868,6 +1989,18 @@ def main():
         save_state(p["state"], state)
         return
 
+    if args.inbox:
+        state = {}
+        if os.path.exists(p["state"]):
+            try:
+                with open(p["state"]) as fh:
+                    state = json.load(fh)
+            except ValueError:
+                state = {}
+        inbox_download(cfg, args.silent, state)
+        save_state(p["state"], state)
+        return
+
     state = {}
     if os.path.exists(p["state"]):
         try:
@@ -1899,6 +2032,9 @@ def main():
             total += merge_history(state, load_watch_history(f, args.silent, ads=ads))
         except (ValueError, OSError, KeyError) as e:
             log("failed to parse %s: %s" % (os.path.basename(f), e), args.silent)
+
+    if not args.dry_run:
+        inbox_download(cfg, args.silent, state)
 
     now = now_utc()
     try:
