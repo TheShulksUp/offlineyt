@@ -168,3 +168,62 @@ def test_dry_run_never_deletes_banned_channel_files(monkeypatch, tmp_path):
     out = _run_main(monkeypatch, dest, state, ["--dry-run"])
     assert os.path.exists(f), "dry run deleted a banned-channel file"
     assert "iiiiiiiiiii" in out["index"]
+
+
+# --- HTML watch-history: ad rows must not reach history ------------------------
+# Older Takeout exports ship watch-history.html instead of .json. The ad pass
+# and the normal pass match the same row shape, so the ad row used to be both
+# remembered for purging *and* merged into history: the analyser then learned to
+# mirror the advertiser, and purge_ad_videos saw a video as both ad-served and
+# watched-on-purpose.
+# NOTE: the parser captures exactly 11 chars, so ids here are 11 chars long.
+
+def _html_row(video_id, when):
+    return ('<div class="content-cell">Watched '
+            'https://www.youtube.com/watch?v=%s</div>'
+            '<div class="mdl-cell">%s</div>' % (video_id, when))
+
+
+def _ad_html_row(video_id, when):
+    return ('<div class="content-cell">From Google Ads</div>'
+            + _html_row(video_id, when))
+
+
+def test_html_ad_rows_are_collected_but_never_merged():
+    html = (_ad_html_row("AdVideoId01", "Sep 25, 2026, 11:23:45 PM")
+            + _html_row("RealVideo00", "Sep 25, 2026, 10:00:00 PM"))
+    ad_videos = {}
+    records = y.records_from_html(html, ads={}, ad_videos=ad_videos)
+
+    assert "AdVideoId01" in ad_videos, "ad video should be tracked for purging"
+    ids = [r["id"] for r in records]
+    assert "RealVideo00" in ids, "real watch was dropped"
+    assert "AdVideoId01" not in ids, "ad row leaked into history"
+
+
+def test_html_shorts_ad_rows_are_skipped_too():
+    html = ('<div class="content-cell">From Google Ads</div>'
+            '<div class="content-cell">Watched '
+            'https://www.youtube.com/shorts/ShrtsId0001</div>'
+            '<div class="mdl-cell">Sep 25, 2026, 9:00:00 PM</div>')
+    ad_videos = {}
+    records = y.records_from_html(html, ads={}, ad_videos=ad_videos)
+    assert list(ad_videos) == ["ShrtsId0001"]
+    assert records == []
+
+
+def test_html_without_ad_tracking_still_parses():
+    """ad_videos=None (no ad tracking requested) must not crash."""
+    html = _html_row("RealVideo00", "Sep 25, 2026, 10:00:00 PM")
+    assert [r["id"] for r in y.records_from_html(html)] == ["RealVideo00"]
+
+
+def test_html_ad_row_is_not_counted_as_a_watch():
+    """End to end: an ad row must not make the analyser mirror a channel."""
+    ad_videos = {}
+    html = _ad_html_row("AdVideoId01", "Sep 25, 2026, 11:23:45 PM")
+    records = y.records_from_html(html, ads={}, ad_videos=ad_videos)
+    state = {}
+    y.merge_history(state, records)
+    assert not state.get("history"), "ad row counted as a watch"
+    assert ad_videos, "but still tracked for purging"

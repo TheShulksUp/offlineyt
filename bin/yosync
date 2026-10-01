@@ -900,7 +900,14 @@ def records_from_html(text, ads=None, ad_videos=None):
     if ad_videos is not None:
         for m in ad_pat.finditer(text):
             ad_videos.setdefault(m.group(1), "")
+    ad_ids = set(ad_videos or ())
     for m in pat.finditer(text):
+        # An ad row matches the same shape as a real one, so the ad pass above
+        # has already claimed it. Without this the ad video is merged into
+        # history *and* remembered for purging, which both teaches the analyser
+        # to mirror the advertiser and marks a watched video for deletion.
+        if m.group(1) in ad_ids:
+            continue
         tstr = m.group(2).replace("\u202f", " ").replace("\xa0", " ")
         try:
             when = datetime.datetime.strptime(tstr, "%b %d, %Y, %I:%M:%S %p")
