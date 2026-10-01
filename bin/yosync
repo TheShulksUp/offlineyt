@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import collections
+import copy
 import datetime
 import json
 import os
@@ -10,8 +11,10 @@ import shutil
 import subprocess
 import sys
 import time
+import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 try:
     import fcntl
 except ImportError:
@@ -206,6 +209,449 @@ def save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_PATH, "w") as fh:
         json.dump(cfg, fh, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Settings web page (--serve)
+# ---------------------------------------------------------------------------
+
+SETTINGS_SCHEMA = [
+    {"id": "library", "title": "Library", "help": "Where your offline library lives. Everything is relative to this.",
+     "fields": [
+        {"key": "dest", "label": "Library folder", "type": "text",
+         "help": "Absolute path. Videos land in <folder>/<Channel>/<Title> [id].mp4."},
+        {"key": "settings_port", "label": "Settings page port", "type": "number", "min": 1024, "max": 65535, "step": 1},
+     ]},
+    {"id": "budgets", "title": "Budgets & rotation", "help": "How much space each channel gets and how old files rotate out.",
+     "fields": [
+        {"key": "budget_per_video", "label": "GB per distinct video watched", "type": "number", "min": 0, "step": 0.01,
+         "help": "Continuous budget formula. 0 disables it and uses budget_tiers instead."},
+        {"key": "budget_min_gb", "label": "Minimum budget (GB)", "type": "number", "min": 0, "step": 0.1},
+        {"key": "budget_max_gb", "label": "Maximum budget (GB)", "type": "number", "min": 0, "step": 0.1},
+        {"key": "channel_budget_gb", "label": "Fallback budget (GB)", "type": "number", "min": 0, "step": 0.1,
+         "help": "Used when no tier matches and budget_per_video is 0."},
+        {"key": "channel_budget_overrides", "label": "Per-channel budgets", "type": "map",
+         "help": "Channel name or URL = GB, one per line (never clamped). Example: SomeTechChannel = 6.0"},
+        {"key": "hot_weeks", "label": "Hot window (weeks)", "type": "number", "min": 1, "step": 1,
+         "help": "Hot = distinct videos watched in the last N weeks."},
+        {"key": "hot_min_watches", "label": "Distinct videos to count as hot", "type": "number", "min": 1, "step": 1},
+        {"key": "cold_days", "label": "Inactive prune threshold (days)", "type": "number", "min": 0, "step": 1,
+         "help": "Channels with no watch in this many days get pruned."},
+        {"key": "stale_grace_days", "label": "Stale-history grace (days)", "type": "number", "min": 0, "step": 1,
+         "help": "Extra pause before pruning when a feed has gone quiet."},
+        {"key": "pack_margin", "label": "Pack margin (headroom)", "type": "number", "min": 0.1, "max": 1, "step": 0.01,
+         "help": "Fraction of budget reserved per download pack so rotation never overshoots."},
+     ]},
+    {"id": "downloads", "title": "Downloads", "help": "What gets downloaded and how. Format is capped at 1440p, avc1 + mp4a for wide player support.",
+     "fields": [
+        {"key": "include_shorts", "label": "Include Shorts (under 60s)", "type": "bool"},
+        {"key": "subtitles", "label": "Download subtitles", "type": "bool"},
+        {"key": "subtitle_langs", "label": "Subtitle languages", "type": "list",
+         "help": "One per line. en, en-orig, en-US, or * (all). Always-English gets a forced fallback."},
+        {"key": "audio_only_channels", "label": "Mirror these as mp3", "type": "list",
+         "help": "Channel names or URLs, one per line. Downloaded as audio for podcast-style listening."},
+        {"key": "max_height", "label": "Max video height (px)", "type": "number", "min": 0, "step": 1},
+        {"key": "recent_uploads", "label": "Recent uploads scanned per channel", "type": "number", "min": 1, "step": 1},
+     ]},
+    {"id": "quickfill", "title": "QuickFill", "help": "Settings for the dedicated fast-fill pass (--quickfill): parallel workers, aria2, and cookies.",
+     "fields": [
+        {"key": "quickfill_workers", "label": "Parallel workers", "type": "number", "min": 1, "step": 1},
+        {"key": "quickfill_fragments", "label": "Concurrent fragments", "type": "number", "min": 1, "step": 1},
+        {"key": "quickfill_recent", "label": "Uploads scanned per hot channel", "type": "number", "min": 1, "step": 1},
+        {"key": "quickfill_margin", "label": "Budget margin (fraction)", "type": "number", "min": 0.1, "max": 1, "step": 0.01},
+        {"key": "quickfill_aria2c", "label": "Use aria2c when available", "type": "bool"},
+        {"key": "quickfill_enrich_workers", "label": "Enrich threads", "type": "number", "min": 1, "step": 1},
+        {"key": "quickfill_cookies", "label": "Cookies (path or browser)", "type": "text",
+         "help": "Path to a cookies.txt file or a browser name (chrome) for --cookies-from-browser."},
+     ]},
+    {"id": "history", "title": "Watch history & Drive", "help": "How yosync gets your Google Takeout watch history.",
+     "fields": [
+        {"key": "drive_remote", "label": "rclone remote name", "type": "text",
+         "help": "Used by --drive to pull the newest Takeout zip."},
+        {"key": "drive_path", "label": "Takeout folder on remote", "type": "text"},
+        {"key": "enrich_limit", "label": "Max videos enriched per run", "type": "number", "min": 1, "step": 1},
+        {"key": "keyword_min_len", "label": "Keyword minimum length", "type": "number", "min": 1, "step": 1},
+        {"key": "keyword_topn", "label": "Keyword top-N per channel", "type": "number", "min": 1, "step": 1},
+        {"key": "takeout_nag", "label": "Remind me to renew Takeout exports", "type": "bool"},
+     ]},
+    {"id": "protection", "title": "Protection & ads", "help": "Channels you never want touched, plus sponsor-block style ad cleanup for the rest.",
+     "fields": [
+        {"key": "exclude_channels", "label": "Protected channels", "type": "list",
+         "help": "Names or URLs, one per line. Never downloaded, never purged, always kept."},
+        {"key": "ad_channel_names", "label": "Banned ad channels", "type": "list"},
+        {"key": "ad_keywords", "label": "Ad keywords", "type": "list",
+         "help": "Channels whose name contains any keyword get purged from the library."},
+     ]},
+    {"id": "verification", "title": "Verification", "help": "Post-download integrity checks for a trustworthy library.",
+     "fields": [
+        {"key": "verify_media", "label": "Verify new downloads", "type": "bool",
+         "help": "ffprobe each new file; broken ones are deleted and re-queued."},
+        {"key": "verify_min_size_mb", "label": "Minimum size fallback (MB)", "type": "number", "min": 0, "step": 0.1,
+         "help": "If ffprobe is missing, files smaller than this are treated as broken."},
+     ]},
+]
+
+SELL = {}
+
+
+def _field(key):
+    for g in SETTINGS_SCHEMA:
+        for f in g["fields"]:
+            if f["key"] == key:
+                return f
+    return None
+
+
+def _base_cfg(cfg):
+    return default_config(cfg.get("dest") or DEFAULT_DEST)
+
+
+def _audio_only_names(cfg):
+    return {str(n).strip().lower() for n in (cfg.get("audio_only_channels") or []) if str(n).strip()}
+
+
+def _is_audio_channel(cfg, ch):
+    names = _audio_only_names(cfg)
+    if not names:
+        return False
+    return (ch.get("name") or "").lower() in names or \
+           (ch.get("key") or "").lower() in names or \
+           (ch.get("url") or "").lower() in names
+
+
+def _coerce_val(ft, value):
+    t = ft.get("type")
+    if t == "text":
+        return "" if value is None else str(value)
+    if t == "number":
+        try:
+            fl = float(value)
+        except (TypeError, ValueError):
+            fl = 0.0
+        lo, hi = ft.get("min"), ft.get("max")
+        if lo is not None and fl < float(lo):
+            fl = float(lo)
+        if hi is not None and fl > float(hi):
+            fl = float(hi)
+        return fl
+    if t == "bool":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    if t == "list":
+        if isinstance(value, str):
+            value = [ln.strip() for ln in value.splitlines() if ln.strip()]
+        return [str(v).strip() for v in (value or []) if str(v).strip()]
+    if t == "map":
+        out = {}
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, str):
+            items = ([ln.split("=", 1) for ln in value.splitlines() if "=" in ln])
+        else:
+            items = []
+        for k, v in items:
+            try:
+                out[str(k).strip()] = float(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+    return value
+
+
+def _schema_with_values(cfg):
+    base = _base_cfg(cfg)
+    groups = copy.deepcopy(SETTINGS_SCHEMA)
+    for g in groups:
+        for f in g["fields"]:
+            f["value"] = cfg.get(f["key"], base.get(f["key"]))
+    return groups
+
+
+def _apply_config_update(cfg, payload):
+    errors = []
+    merged = dict(cfg)
+    if not isinstance(payload, dict):
+        return merged, ["request body must be a JSON object"]
+    for key, value in payload.items():
+        ft = _field(key)
+        if ft is None:
+            errors.append("unknown key: " + key)
+            continue
+        coerced = _coerce_val(ft, value)
+        if ft.get("type") == "text" and key == "dest" and not str(coerced).strip():
+            errors.append("library folder cannot be empty")
+            continue
+        merged[key] = coerced
+    if not merged.get("dest"):
+        errors.append("library folder cannot be empty")
+    return merged, errors
+
+
+def _state_payload(cfg):
+    p = paths_in_dest(cfg["dest"])
+    state = {}
+    try:
+        with open(p["state"]) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    hot = []
+    try:
+        channels = analyze(cfg, state.get("history") or [], now_utc())
+        for ch in sorted((c for c in channels.values() if c.get("hot")),
+                         key=lambda c: channel_budget(cfg, c), reverse=True):
+            hot.append({
+                "name": ch.get("name"),
+                "key": ch.get("key"),
+                "budget_gb": round(channel_budget(cfg, ch) / 1e9, 2),
+                "distinct": ch.get("distinct"),
+                "audio": _is_audio_channel(cfg, ch),
+                "override": bool(cfg.get("channel_budget_overrides") or {}).__class__ and
+                            (ch.get("name") in (cfg.get("channel_budget_overrides") or {}) or
+                             ch.get("key") in (cfg.get("channel_budget_overrides") or {}) or
+                             ch.get("url") in (cfg.get("channel_budget_overrides") or {})),
+            })
+    except Exception:
+        pass
+    usage = free_space(cfg)
+    return {
+        "dest": cfg.get("dest"),
+        "last_run": state.get("last_run"),
+        "last_ingest": state.get("last_ingest"),
+        "history": len(state.get("history") or []),
+        "index": len(state.get("index") or {}),
+        "hot": hot,
+        "free_gb": round(usage.free / 1e9, 1) if usage else None,
+    }
+
+
+class _SettingsHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, text):
+        body = text.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        cfg = SELL.get("cfg") or {}
+        if self.path in ("/", "/index.html"):
+            self._html(SETTINGS_HTML.replace("__PORT__", str(cfg.get("settings_port", 8765))))
+        elif self.path == "/api/schema":
+            self._json(_schema_with_values(cfg))
+        elif self.path == "/api/config":
+            self._json(cfg)
+        elif self.path == "/api/state":
+            self._json(_state_payload(cfg))
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        cfg = SELL.get("cfg") or {}
+        if self.path != "/api/config":
+            self._json({"error": "not found"}, 404)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads((self.rfile.read(n) or b"{}").decode() or "{}")
+        except (ValueError, json.JSONDecodeError):
+            self._json({"error": "bad request body"}, 400)
+            return
+        merged, errors = _apply_config_update(cfg, payload)
+        if errors:
+            self._json({"error": "; ".join(errors)}, 400)
+            return
+        merged["dest"] = os.path.expanduser(merged["dest"])
+        save_config(merged)
+        SELL["cfg"] = merged
+        self._json({"ok": True})
+
+
+def serve_settings(cfg, silent=False):
+    SELL["cfg"] = cfg
+    port = int(cfg.get("settings_port", 8765))
+    url = "http://127.0.0.1:%d" % port
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), _SettingsHandler)
+    except OSError:
+        log("could not bind %s — is a settings page already open?" % url, silent)
+        return
+    if not silent:
+        log("settings page: %s  (Ctrl+C to stop)" % url)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+SETTINGS_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OfflineYT &middot; Settings</title>
+<style>
+:root{--bg:#0f1115;--panel:#161a21;--panel2:#1e232d;--text:#e6e9ef;--muted:#96a0b2;--accent:#4f8cff;--green:#3fbf7f;--red:#f25f5c;--border:#2a303c;--mono:ui-monospace,Menlo,monospace}
+*{box-sizing:border-box}body{margin:0;font:14px/1.55 -apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:baseline;gap:10px;padding:14px 22px;border-bottom:1px solid var(--border)}
+header h1{margin:0;font-size:16px;font-weight:700}header .tag{color:var(--muted);font-size:12px}
+nav{display:flex;gap:6px;padding:10px 22px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg);z-index:5}
+nav button{background:transparent;border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font:inherit;font-size:13px}
+nav button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+main{padding:20px 24px;max-width:980px;margin:0 auto}
+.group{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:16px}
+.group h2{margin:0 0 2px;font-size:15px}.group>p{color:var(--muted);margin:0 0 6px;font-size:12px}
+.row{display:grid;grid-template-columns:minmax(200px,1fr) minmax(240px,1.4fr);gap:4px 18px;padding:10px 0;border-top:1px solid var(--panel2);align-items:start}
+.row:last-child{border-bottom:1px solid var(--panel2)}
+.row label{font-weight:500;padding-top:5px}
+.row input[type=text],.row input[type=number],.row textarea{background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 10px;font:inherit;width:100%}
+.row textarea{font-family:var(--mono);font-size:12px;min-height:52px;resize:vertical}
+.row input[type=number]{width:160px}
+.row .help{color:var(--muted);font-size:11px;margin-top:3px}
+.row input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent);margin-top:5px}
+.savebar{position:sticky;bottom:0;display:flex;align-items:center;gap:14px;background:linear-gradient(transparent,var(--bg) 40%);padding:14px 0 6px}
+.savebar button{background:var(--accent);color:#fff;border:none;padding:10px 26px;border-radius:10px;font-weight:600;cursor:pointer}
+.savebar .status{font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--panel2)}
+th{color:var(--muted);font-weight:600}
+.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid var(--border);color:var(--muted)}
+.badge.audio{color:var(--green);border-color:var(--green)}
+.badge.hot{color:var(--accent);border-color:var(--accent)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.card .v{font-size:20px;font-weight:700}.card .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.doc h3{font-size:14px;margin:22px 0 6px}.doc p,.doc li{color:#c9d1dc;font-size:13px}
+.doc code{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:1px 6px;font-family:var(--mono);font-size:12px}
+pre{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;overflow:auto;font-family:var(--mono);font-size:12px}
+a{color:var(--accent)}.muted{color:var(--muted)}
+</style></head><body>
+<header><h1>OfflineYT</h1><span class="tag">settings · http://127.0.0.1:__PORT__</span></header>
+<nav>
+<button id="nav-settings" class="on" onclick="view('settings')">Settings</button>
+<button id="nav-status" onclick="view('status')">Status</button>
+<button id="nav-help" onclick="view('help')">Help</button>
+<button id="nav-trouble" onclick="view('trouble')">Troubleshooting</button>
+</nav>
+<main id="view"></main>
+<script>
+const $=(s,e=document)=>e.querySelector(s);
+const $$=(s,e=document)=>[...e.querySelectorAll(s)];
+let SCHEMA=[];
+async function api(p,opts){const r=await fetch(p,opts);let j;try{j=await r.json()}catch(_){j={}}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function toast(msg,bad){const s=$('#status');if(!s)return;s.textContent=msg;s.style.color=bad?'var(--red)':'var(--green)';clearTimeout(s._t);s._t=setTimeout(()=>s.textContent='',3000)}
+
+function renderSettings(){
+ const root=$('#view');root.innerHTML='';
+ SCHEMA.forEach(g=>{
+  const gr=document.createElement('div');gr.className='group';
+  gr.innerHTML='<h2>'+esc(g.title)+'</h2>'+'<p>'+esc(g.help||'')+'</p>';
+  g.fields.forEach(f=>{
+   const row=document.createElement('div');row.className='row';
+   const id='f_'+f.key;
+   let ctl;
+   if(f.type==='bool')ctl='<input type="checkbox" id="'+id+'" '+(f.value?'checked':'')+'>';
+   else if(f.type==='number')ctl='<input type="number" id="'+id+'" value="'+esc(f.value)+'" min="'+(f.min??'')+'" max="'+(f.max??'')+'" step="'+(f.step??'any')+'">';
+   else if(f.type==='list')ctl='<textarea id="'+id+'" placeholder="one per line">'+esc((f.value||[]).join('\n'))+'</textarea>';
+   else if(f.type==='map')ctl='<textarea id="'+id+'" placeholder="Channel Name = 5.0">'+esc(Object.entries(f.value||{}).map(([k,v])=>k+' = '+v).join('\n'))+'</textarea>';
+   else ctl='<input type="text" id="'+id+'" value="'+esc(f.value)+'">';
+   row.innerHTML='<label for="'+id+'">'+esc(f.label)+'</label><div>'+ctl+(f.help?'<div class="help">'+esc(f.help)+'</div>':'')+'</div>';
+   gr.appendChild(row);
+  });
+  root.appendChild(gr);
+ });
+ const bar=document.createElement('div');bar.className='savebar';
+ bar.innerHTML='<button onclick="save()">Save settings</button><span class="status" id="status"></span>';
+ root.appendChild(bar);
+}
+function collect(){
+ const out={};
+ SCHEMA.forEach(g=>g.fields.forEach(f=>{
+  const el=document.getElementById('f_'+f.key);if(!el)return;
+  if(f.type==='bool')out[f.key]=el.checked;
+  else if(f.type==='list')out[f.key]=el.value.split('\n').map(s=>s.trim()).filter(Boolean);
+  else if(f.type==='map'){const m={};el.value.split('\n').forEach(ln=>{if(ln.includes('=')){const[k,v]=ln.split(/=(.*)/s).map(s=>s.trim());const n=parseFloat(v);if(k&&!isNaN(n))m[k]=n}});out[f.key]=m;}
+  else if(f.type==='number'){const n=parseFloat(el.value);out[f.key]=isNaN(n)?0:n;}
+  else out[f.key]=el.value;
+ }));return out;
+}
+async function save(){try{await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});toast('Saved');SCHEMA=await api('/api/schema');renderSettings();}catch(e){toast('Error: '+e.message,true)}}
+
+async function renderStatus(){
+ const s=await api('/api/state');const root=$('#view');root.innerHTML='';
+ const cards=[
+  ['Last run',esc(s.last_run||'—')],
+  ['Last ingest',esc(s.last_ingest||'—')],
+  ['Videos in library',s.index],
+  ['History records',s.history],
+  ['Free space',(s.free_gb!=null?s.free_gb+' GB':'—')],
+ ];
+ root.innerHTML='<div class="cards">'+cards.map(c=>'<div class="card"><div class="v">'+c[1]+'</div><div class="k">'+c[0]+'</div></div>').join('')+'</div>';
+ root.innerHTML+='<div class="group"><h2>Hot channels</h2><p>Budgets come from your watch history. Per-channel overrides override the formula.</p><table><tr><th>Channel</th><th>Budget</th><th>Videos (2w)</th><th>Type</th></tr>'+
+  (s.hot||[]).map(h=>'<tr><td>'+esc(h.name)+'</td><td>'+esc(h.budget_gb)+' GB</td><td>'+esc(h.distinct)+'</td><td>'+(h.audio?'<span class="badge audio">audio</span>':'<span class="badge">video</span>')+(h.override?' <span class="badge">override</span>':'')+'</td></tr>').join('')+'</table></div>';
+ if(!(s.hot||[]).length)root.innerHTML+='<p class="muted">No hot channels yet — ingest some watch history first.</p>';
+}
+function renderHelp(){
+ const root=$('#view');root.className='doc';
+ root.innerHTML=`
+<h3>How budgets work</h3>
+<p>Each channel gets <b>0.17 GB &times; distinct videos you watched in the last 2 weeks</b>, clamped between <code>budget_min_gb</code> and <code>budget_max_gb</code>. Hot channels rotate automatically: yosync downloads the newest uploads, then swaps out the oldest files to stay in budget.</p>
+<h3>QuickFill</h3>
+<p>Run <code>yosync --quickfill</code> to fill hot channels toward budget right now, using parallel workers + aria2 when present. Add <code>--logs</code> to watch it live.</p>
+<h3>Watch history</h3>
+<p>yosync is driven by your Google Takeout <i>watch history</i>, not subscriptions. Export it at <a href="https://takeout.google.com/settings/takeout" target="_blank" rel="noopener">takeout.google.com</a>, drop the zip into <code>.yosync/incoming/</code> (or <code>yosync --ingest &lt;zip&gt;</code>), and let it learn what you watch. Use <code>--drive</code> to pull the newest export automatically via rclone.</p>
+<h3>Ad cleanup</h3>
+<p>Channels you watch that turned into paid-ad slots get detected and reclaimed. You can add manual bans under Protection, and any name matching an <code>ad_keyword</code> gets purged. Channels listed in <code>exclude_channels</code> are never touched.</p>
+<h3>Background sync</h3>
+<p><code>yosync --daemon</code> installs a launchd agent that syncs daily via <code>--drive --silent</code>. Toggle with <code>--no-daemon</code>. These files are set up in the raw <code>config.json</code>, but everything in this page updates them live.</p>
+`;
+}
+function renderTrouble(){
+ const root=$('#view');root.className='doc';
+ root.innerHTML=`
+<h3>Nothing downloads</h3>
+<p>Run <code>yosync --dry-run</code> first — it prints exactly what would happen without touching your library. Check <code>logs/sync.log</code> under the library's <code>.yosync/</code> folder.</p>
+<h3>Everything is stale</h3>
+<p>Renew the export: download a fresh Google Takeout <i>watch history</i> zip and ingest it. Or run <code>yosync --drive</code> to pull the newest one automatically.</p>
+<h3>Downloads fail</h3>
+<p>YouTube rate-limits anonymous access. Add cookies (path or browser name) under QuickFill &rarr; Cookies so yt-dlp authenticates, or hand-download a video via yt-dlp to confirm the network is fine.</p>
+<h3>Disk is filling up</h3>
+<p>Lower <code>budget_per_video</code>, raise the pack margin, or set per-channel overrides under Budgets. Check <code>file free</code> and the Status tab.</p>
+<h3>State and files disagree</h3>
+<p>Run the integrity check (<code>yosync --verify</code>) — it detects missing or corrupt files and reconciles the index.</p>
+<h3>youtube blocked / age-restricted</h3>
+<p>Unauthenticated downloads can fail for age-restricted or region-locked videos — the cookies setting fixes most of these.</p>
+<h3>Logs</h3>
+<p>Every run writes <code>logs/sync.log</code>. If something breaks, read the last run there first before re-running a full sync.</p>
+`;
+}
+function view(name){
+ const navs={'settings':renderSettings,'status':renderStatus,'help':renderHelp,'trouble':renderTrouble};
+ ['settings','status','help','trouble'].forEach(n=>$('#nav-'+n).classList.toggle('on',n===name));
+ if(name==='status'||name==='settings'){$('#view').className='';}
+ navs[name]();
+}
+(async function(){SCHEMA=await api('/api/schema');renderSettings();})();
+</script></body></html>
+"""
 
 
 def paths_in_dest(dest):
@@ -1211,7 +1657,8 @@ def main():
                "  yosync --daemon         enable daily background sync\n"
                "  yosync --no-daemon      disable background sync\n"
                "  yosync --topup          fill hot channels toward budget now\n"
-               "  yosync --quickfill      fast fill, heavy parallelism (Ctrl+C to abort)")
+               "  yosync --quickfill      fast fill, heavy parallelism (Ctrl+C to abort)\n"
+               "  yosync --serve          open the settings page in your browser")
     ap.add_argument("--setup", action="store_true", help="run setup wizard")
     ap.add_argument("--dest", help="offline folder (default ~/Movies/OfflineYouTube)")
     ap.add_argument("--dry-run", action="store_true", help="preview only, no downloads")
@@ -1231,13 +1678,17 @@ def main():
                          "normal background filling resumes unchanged")
     ap.add_argument("--logs", action="store_true",
                     help="stream yt-dlp download logs to stdout while running")
+    ap.add_argument("--serve", action="store_true",
+                    help="open the in-browser settings page (schema + status + help)")
     args = ap.parse_args()
 
-    if args.ingest and (args.daemon or args.no_daemon or args.setup):
-        ap.error("--ingest cannot be combined with setup/daemon flags")
+    if args.ingest and (args.daemon or args.no_daemon or args.setup or args.serve):
+        ap.error("--ingest cannot be combined with setup/daemon/serve flags")
 
     _lock = acquire_lock()
     cfg = load_config(silent=args.silent)
+    if args.serve and not cfg:
+        cfg = default_config(args.dest or DEFAULT_DEST)
     if args.setup:
         cfg = cfg or default_config(args.dest or DEFAULT_DEST)
         setup_wizard(cfg, args, args.silent)
@@ -1255,6 +1706,10 @@ def main():
         if not args.silent:
             log("background sync %s" %
                 ("enabled (daily 6am)" if daemon else "disabled"))
+        return
+
+    if args.serve:
+        serve_settings(cfg, args.silent)
         return
 
     p = paths_in_dest(cfg["dest"])
@@ -1319,6 +1774,9 @@ def main():
 
         if args.dry_run and not args.silent:
             log("dry run complete: nothing downloaded")
+        if not args.silent:
+            log("settings page: http://127.0.0.1:%d  (run: yosync --serve)" %
+                int(cfg.get("settings_port", 8765)))
     except KeyboardInterrupt:
         try:
             save_state(p["state"], state)
