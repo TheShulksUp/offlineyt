@@ -81,7 +81,7 @@ The library looks like this:
 
 ---
 
-## Setup (two options)
+## Setup (three options)
 
 ### A) One-click (macOS) — recommended
 
