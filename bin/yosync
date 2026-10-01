@@ -1189,6 +1189,31 @@ def _clean_empty_dirs(dest):
                 pass
 
 
+def _remove_with_sidecars(path):
+    removed = 0
+    try:
+        if os.path.isfile(path):
+            os.unlink(path)
+            removed += 1
+    except OSError:
+        pass
+    head, tail = os.path.split(path)
+    stem, _ = os.path.splitext(tail)
+    if os.path.isdir(head):
+        for f in os.listdir(head):
+            if not f.startswith(stem + "."):
+                continue
+            if os.path.splitext(f)[1].lower() in (".srt", ".vtt", ".sbv",
+                                                  ".ass", ".ssa", ".mp3",
+                                                  ".m4a", ".opus", ".webm"):
+                try:
+                    os.unlink(os.path.join(head, f))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 def _folder_size(path):
     if os.path.isfile(path):
         try:
@@ -1207,10 +1232,11 @@ def _folder_size(path):
     return total
 
 
-def _simulate_sizes(cfg, urls, archive):
-    cmd = ["yt-dlp", "-f", FMT, "--skip-download", "--no-warnings",
-           "--no-call-home", "--print", "%(id)s\t%(filesize_approx)s",
-           "-i", "--download-archive", archive] + urls
+def _simulate_sizes(cfg, urls, archive, audio=False):
+    cmd = ["yt-dlp", "-f", "ba" if audio else FMT, "--skip-download",
+           "--no-warnings", "--no-call-home", "--print",
+           "%(id)s\t%(filesize_approx)s", "-i",
+           "--download-archive", archive] + urls
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (subprocess.TimeoutExpired, OSError):
@@ -1238,7 +1264,7 @@ def _drop_indexed_files(cfg, index, archive_lines, ids, silent, skip_ids=None):
             continue
         try:
             if os.path.isfile(info["path"]):
-                os.unlink(info["path"])
+                _remove_with_sidecars(info["path"])
                 removed += 1
         except OSError:
             pass
@@ -1318,6 +1344,7 @@ def download(cfg, channels, index, silent, dry=False, state=None, no_rotate=Fals
         used = sum(_folder_size(info["path"]) for info in index.values()
                    if info.get("channel") == ch["key"])
         budget = channel_budget(cfg, ch)
+        audio = _is_audio_channel(cfg, ch)
         headroom = budget - used
         margin = cfg.get("pack_margin", 0.92) if not quickfill \
             else cfg.get("quickfill_margin", 0.95)
@@ -1333,13 +1360,13 @@ def download(cfg, channels, index, silent, dry=False, state=None, no_rotate=Fals
             members = [info for info in index.values()
                        if info.get("channel") == ch["key"]]
             msz = [_folder_size(info["path"]) for info in members]
-            est = (sum(msz) / len(msz)) if msz else 90 * 1024 * 1024
+            est = (sum(msz) / len(msz)) if msz else (45 if audio else 90) * 1024 * 1024
             n = max(1, int((headroom * margin) / est))
             pack = cand[:n]
             acc = est * len(pack)
         else:
             if not dry:
-                sizes = _simulate_sizes(cfg, [d["url"] for d in cand], archive)
+                sizes = _simulate_sizes(cfg, [d["url"] for d in cand], archive, audio=audio)
             pack = []
             if sizes:
                 for d in cand:
@@ -1354,7 +1381,7 @@ def download(cfg, channels, index, silent, dry=False, state=None, no_rotate=Fals
                 members = [info for info in index.values()
                            if info.get("channel") == ch["key"]]
                 msz = [_folder_size(info["path"]) for info in members]
-                est = (sum(msz) / len(msz)) if msz else 90 * 1024 * 1024
+                est = (sum(msz) / len(msz)) if msz else (45 if audio else 90) * 1024 * 1024
                 n = max(1, int((headroom * margin) / est))
                 pack = cand[:n]
                 acc = est * len(pack)
@@ -1391,7 +1418,8 @@ def download(cfg, channels, index, silent, dry=False, state=None, no_rotate=Fals
                              aria2c=bool(quickfill and cfg.get("quickfill_aria2c", True)),
                              stream=logs,
                              cookies=qf_cookies,
-                             cookies_file=qf_cookies_file)
+                             cookies_file=qf_cookies_file,
+                             audio=audio)
         downloaded = set()
         for line in outs:
             if not line.strip():
@@ -1439,11 +1467,7 @@ def _trim_to_budget(cfg, index, archive_lines, chkey, budget, silent):
             return
         members.sort(key=lambda info: info.get("t", ""))
         drop = members[0]
-        try:
-            if os.path.isfile(drop["path"]):
-                os.unlink(drop["path"])
-        except OSError:
-            pass
+        _remove_with_sidecars(drop["path"])
         vid = next((v for v, i in index.items() if i is drop), None)
         if vid:
             archive_lines.discard(vid)
@@ -1454,7 +1478,7 @@ def _trim_to_budget(cfg, index, archive_lines, chkey, budget, silent):
 def reconcile_index(cfg, index, cache, silent):
     dest = cfg["dest"]
     now = now_utc()
-    pat = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.(mp4|mkv|webm|m4v|flv)$")
+    pat = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.(mp4|mkv|webm|m4v|flv|mp3|m4a)$")
     added = 0
     for root, _dirs, files in os.walk(dest):
         rel = os.path.relpath(root, dest)
@@ -1481,16 +1505,37 @@ def reconcile_index(cfg, index, cache, silent):
     return added
 
 
-def _run_download(cfg, archive, urls, parallel=0, fragment_limit=0,
-                  aria2c=False, stream=False, cookies=None, cookies_file=None):
-    p = paths_in_dest(cfg["dest"])
-    cmd = ["yt-dlp", "-f", FMT, "--merge-output-format", "mp4",
-           "--download-archive", archive,
-           "-o", os.path.join(cfg["dest"], "%(uploader)s", "%(title)s [%(id)s].%(ext)s"),
+def _download_args(cfg, archive, audio=False):
+    cmd = ["yt-dlp", "--download-archive", archive,
+           "-o", os.path.join(cfg["dest"], "%(uploader)s",
+                              "%(title)s [%(id)s].%(ext)s"),
            "--print", "after_move:filepath",
            "--sleep-requests", "1", "-i",
            "--retries", "5", "--fragment-retries", "10",
            "--extractor-retries", "3"]
+    if audio:
+        cmd[1:1] = ["-f", "ba", "-x", "--audio-format", "mp3",
+                    "--audio-quality", "0"]
+        cmd[cmd.index("-o") + 1] = os.path.join(
+            cfg["dest"], "%(uploader)s", "%(title)s [%(id)s].mp3")
+    else:
+        cmd[1:1] = ["-f", FMT, "--merge-output-format", "mp4"]
+        if cfg.get("subtitles"):
+            langs = ",".join(str(s).strip() for s in
+                             (cfg.get("subtitle_langs") or ["en"])
+                             if str(s).strip()) or "en"
+            cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", langs,
+                    "--sub-format", "srt/best", "--convert-subs", "srt"]
+        if not cfg.get("include_shorts", True):
+            cmd += ["--match-filter", "!duration<60"]
+    return cmd
+
+
+def _run_download(cfg, archive, urls, parallel=0, fragment_limit=0,
+                  aria2c=False, stream=False, cookies=None, cookies_file=None,
+                  audio=False):
+    p = paths_in_dest(cfg["dest"])
+    cmd = _download_args(cfg, archive, audio=audio)
     if cookies_file:
         cmd += ["--cookies", cookies_file]
     elif cookies:
