@@ -1066,6 +1066,10 @@ def channel_distinct(cfg, ch, now=None):
 
 
 def channel_budget(cfg, ch, now=None):
+    ovr = cfg.get("channel_budget_overrides") or {}
+    for k in (ch.get("name"), ch.get("key"), ch.get("url")):
+        if k and k in ovr:
+            return float(ovr[k]) * 1024 ** 3
     distinct = channel_distinct(cfg, ch, now)
     per_video = cfg.get("budget_per_video")
     if per_video:
