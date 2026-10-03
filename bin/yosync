@@ -359,7 +359,11 @@ def _coerce_val(ft, value):
             fl = float(lo)
         if hi is not None and fl > float(hi):
             fl = float(hi)
-        return fl
+        # Counts must stay ints: saving settings turned enrich_limit 150 into
+        # 150.0, and missing[:150.0] throws TypeError on the next sync (this
+        # killed every run, including --dry-run). Fractional values like the
+        # 0.17 budget keep their float.
+        return int(fl) if fl.is_integer() else fl
     if t == "bool":
         if isinstance(value, bool):
             return value

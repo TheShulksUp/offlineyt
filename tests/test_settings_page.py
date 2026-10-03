@@ -28,6 +28,31 @@ def test_coerce_number_clamps_to_min_max():
     assert y._coerce_val(ft, "4.5") == 4.5
 
 
+def test_coerce_number_keeps_counts_as_int():
+    """Regression: saving settings turned enrich_limit 150 into 150.0, and
+    missing[:150.0] throws TypeError, killing every sync including --dry-run.
+    Integral numbers must come back as int; fractional ones stay float."""
+    ft = {"key": "x", "type": "number"}
+    assert y._coerce_val(ft, "150") == 150
+    assert isinstance(y._coerce_val(ft, "150"), int)
+    assert y._coerce_val(ft, 150.0) == 150
+    assert isinstance(y._coerce_val(ft, 150.0), int)
+    assert y._coerce_val(ft, "0.17") == 0.17
+    assert isinstance(y._coerce_val(ft, "0.17"), float)
+    assert y._coerce_val(ft, "garbage") == 0
+    assert isinstance(y._coerce_val(ft, "garbage"), int)
+
+
+def test_page_saved_enrich_limit_still_slices(tmp_path, monkeypatch):
+    """End to end for the incident: a config saved by the settings page must
+    survive enrich_channels, which slices with enrich_limit."""
+    cfg = y.default_config(str(tmp_path))
+    merged, errors = y._apply_config_update(cfg, {"enrich_limit": "150"})
+    assert errors == []
+    assert isinstance(merged["enrich_limit"], int)
+    assert [1, 2, 3][:merged["enrich_limit"]] == [1, 2, 3]
+
+
 def test_coerce_bool_from_string():
     ft = {"key": "x", "type": "bool"}
     assert y._coerce_val(ft, "true") is True
