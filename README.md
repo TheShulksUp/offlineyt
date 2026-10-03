@@ -4,6 +4,8 @@
 
 > If this looks useful, ⭐ **star the repo** — it helps others find it.
 
+![A dry run: resolving channels, then the per-channel budget report (channel names blurred for privacy)](assets/demo.gif)
+
 ## Why
 
 YouTube is a stream, but good content isn't. If you want the videos you care about **backed up, ad-free and forever yours**, there was no clean way to do it: downloading a whole channel wastes disk on things you never watch, and manual `yt-dlp` one-offs don't scale across the channels you follow.
