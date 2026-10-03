@@ -1,6 +1,8 @@
 # OfflineYT · your own offline YouTube library
 
-> Mirror the channels you **actually watch** to a local/iCloud library — driven by your **Google Takeout watch history**.
+> Your YouTube, backed up: mirror only the channels you **actually watch** — automatically, daily, ad-free.
+
+> If this looks useful, ⭐ **star the repo** — it helps others find it.
 
 ## Why
 
