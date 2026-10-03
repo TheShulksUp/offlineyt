@@ -1384,14 +1384,22 @@ def prune(cfg, channels, index, archive_lines, silent, state=None):
         return 0
     for vid in prune_ids:
         path = index[vid]["path"]
-        try:
-            if os.path.isfile(path):
-                os.unlink(path)
-                removed += 1
-        except OSError:
-            pass
-    keep = [ln for ln in archive_lines if ln not in prune_ids]
+        if _unlink_confirmed(path):
+            removed += 1
+        else:
+            # Deletion failed: keep the index entry and the archive line so we
+            # still know the file exists and don't re-download a second copy.
+            prune_ids.discard(vid)
+            if not silent:
+                log("could not delete %s (kept in index; will retry)"
+                    % os.path.basename(path))
+    if not prune_ids:
+        return 0
+    for vid in prune_ids:
+        _discard_archive(archive_lines, vid)
+    keep = [ln for ln in archive_lines if ln.strip()]
     p = paths_in_dest(cfg["dest"])
+    os.makedirs(os.path.dirname(p["archive"]), exist_ok=True)
     with open(p["archive"], "w") as fh:
         fh.write("\n".join(keep))
     for vid in prune_ids:
@@ -1443,6 +1451,25 @@ def _remove_with_sidecars(path):
                 except OSError:
                     pass
     return removed
+
+
+def _unlink_confirmed(path):
+    """Delete path (plus sidecars) and report whether it is really gone.
+
+    _remove_with_sidecars swallows OSError, which is fine for counting but
+    dangerous for bookkeeping: callers used to drop the index entry and the
+    download-archive line on the assumption the file was deleted. When the
+    unlink failed (iCloud Drive evicting/rehydrating, a file still open) the
+    file stayed on disk while yosync forgot it, so the next run re-downloaded
+    the same video into yt-dlp's numbered variant -- "Title [ID] 2.mp4" --
+    and reconcile_index could never see that name again. Anything that
+    forgets a download MUST therefore check this returns True.
+    """
+    _remove_with_sidecars(path)
+    try:
+        return not os.path.exists(path)
+    except OSError:
+        return False
 
 
 def _folder_size(path):
@@ -1698,19 +1725,31 @@ def _trim_to_budget(cfg, index, archive_lines, chkey, budget, silent):
             return
         members.sort(key=lambda info: info.get("t", ""))
         drop = members[0]
-        _remove_with_sidecars(drop["path"])
+        members.remove(drop)
+        if not _unlink_confirmed(drop["path"]):
+            # Still on disk. Keep tracking it, otherwise the next run would
+            # re-download it into a " 2" file and we'd leak the original.
+            if not silent:
+                log("could not delete %s (kept in index; will retry)"
+                    % os.path.basename(drop["path"]))
+            continue
         vid = next((v for v, i in index.items() if i is drop), None)
         if vid:
-            archive_lines.discard(vid)
+            _discard_archive(archive_lines, vid)
             index.pop(vid, None)
-        members.remove(drop)
 
 
 def reconcile_index(cfg, index, cache, silent):
     dest = cfg["dest"]
     now = now_utc()
-    pat = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.(mp4|mkv|webm|m4v|flv|mp3|m4a)$")
-    added = 0
+    # Canonical name is "<title> [<id>].ext". yt-dlp appends " N" when it is
+    # told to fetch a video whose canonical file is still on disk, so accept
+    # that variant too -- otherwise the numbered copy is invisible to every
+    # later prune and can never be reclaimed. Fragments left by an interrupted
+    # merge ("<title> [<id>].f298.mp4") still do not match and stay out.
+    pat = re.compile(
+        r"\[([A-Za-z0-9_-]{11})\](?: (?P<n>\d+))?\.(mp4|mkv|webm|m4v|flv|mp3|m4a)$")
+    found = []
     for root, _dirs, files in os.walk(dest):
         rel = os.path.relpath(root, dest)
         if rel == "." or rel.startswith(".yosync") or rel.startswith("inbox"):
@@ -1719,18 +1758,26 @@ def reconcile_index(cfg, index, cache, silent):
             m = pat.search(fn)
             if not m:
                 continue
-            vid = m.group(1)
-            if vid in index:
-                continue
-            meta = cache.get(vid, {})
-            folder = os.path.basename(root)
-            index[vid] = {
-                "channel": meta.get("channel_url") or folder,
-                "name": meta.get("channel") or folder,
-                "path": os.path.join(root, fn),
-                "t": now.isoformat(),
-            }
-            added += 1
+            found.append((m.group(1), m.group("n"),
+                          os.path.join(root, fn), os.path.basename(root)))
+    # Canonical (no " N") first so the index always points at the real name,
+    # then numbered variants to rescue genuinely orphaned copies.
+    found.sort(key=lambda t: (t[1] is not None, t[1] or "", t[2]))
+    added = 0
+    for vid, num, path, folder in found:
+        if vid in index:
+            continue
+        meta = cache.get(vid, {})
+        index[vid] = {
+            "channel": meta.get("channel_url") or folder,
+            "name": meta.get("channel") or folder,
+            "path": path,
+            "t": now.isoformat(),
+        }
+        added += 1
+        if num and not silent:
+            log("reconciled orphaned copy into index: %s"
+                % os.path.basename(path))
     if added and not silent:
         log("reconciled %d file(s) into index from disk" % added)
     return added
@@ -1782,6 +1829,134 @@ def _discard_archive(archive_lines, vid):
     archive_lines.discard("YouTube " + vid)
 
 
+def _scan_duplicate_copies(cfg):
+    """Find redundant files left by the double-download bug.
+
+    Returns (dupes, orphans, temps) where dupes is a list of
+    (video_id, keep_path, drop_path) tuples -- one per redundant copy -- and
+    orphans are pre-merge fragments ("<title> [<id>].f298.mp4") from a
+    download that died between the fragment and the merge.
+    """
+    dest = cfg["dest"]
+    vid_pat = re.compile(r"\[([A-Za-z0-9_-]{11})\](?: (\d+))?\.\w+$")
+    frag_pat = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.f\d+\.\w+$")
+    by_id = {}
+    orphans = []
+    temps = []
+    for root, _dirs, files in os.walk(dest):
+        rel = os.path.relpath(root, dest)
+        if rel == "." or rel.startswith(".yosync") or rel.startswith("inbox"):
+            continue
+        for fn in files:
+            path = os.path.join(root, fn)
+            if fn.endswith((".part", ".ytdl", ".aria2", ".temp", ".tmp")):
+                temps.append(path)
+                continue
+            fm = frag_pat.search(fn)
+            if fm:
+                orphans.append((fm.group(1), path))
+                continue
+            m = vid_pat.search(fn)
+            if m:
+                by_id.setdefault(m.group(1), []).append(
+                    (m.group(2), path))
+    dupes = []
+    for vid, files in by_id.items():
+        if len(files) < 2:
+            continue
+        files.sort(key=lambda t: (t[0] is not None, t[0] or "", t[1]))
+        keep = files[0][1]
+        for _num, drop in files[1:]:
+            dupes.append((vid, keep, drop))
+    dupes.sort(key=lambda t: t[2])
+    return dupes, orphans, temps
+
+
+def dedupe_library(cfg, state, apply=False, silent=False):
+    """Report (and optionally remove) duplicate copies and download leftovers.
+
+    Dry run unless apply=True. The download archive and the index are only
+    touched when something was actually deleted, and the file kept is always
+    the canonical "<title> [<id>].mp4" when one exists.
+    """
+    index = state.setdefault("index", {})
+    archive = paths_in_dest(cfg["dest"])["archive"]
+    os.makedirs(os.path.dirname(archive), exist_ok=True)
+    archive_lines = set()
+    if os.path.exists(archive):
+        with open(archive) as fh:
+            archive_lines = {ln.strip() for ln in fh if ln.strip()}
+    dupes, orphans, temps = _scan_duplicate_copies(cfg)
+    freed = 0
+    kept_ids = set()
+    dropped = 0
+    for vid, keep, drop in dupes:
+        try:
+            size = os.path.getsize(drop)
+        except OSError:
+            size = 0
+        if not apply:
+            if not silent:
+                log("duplicate: keeping %s" % os.path.basename(keep))
+                log("           would remove %s (%.1f MB)"
+                    % (os.path.basename(drop), size / 1e6))
+            freed += size
+            continue
+        if not _unlink_confirmed(drop):
+            if not silent:
+                log("duplicate: could not remove %s (will retry)"
+                    % os.path.basename(drop))
+            continue
+        # Keep the surviving file the one the index points at.
+        info = index.get(vid)
+        if info and info.get("path") == drop:
+            info["path"] = keep
+        kept_ids.add(vid)
+        freed += size
+        dropped += 1
+    frag_freed = 0
+    for vid, path in orphans:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if apply:
+            if _unlink_confirmed(path):
+                frag_freed += size
+        else:
+            frag_freed += size
+            if not silent:
+                log("fragment: would remove %s (%.1f MB, incomplete download)"
+                    % (os.path.basename(path), size / 1e6))
+    temp_freed = 0
+    for path in temps:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if apply:
+            if _unlink_confirmed(path):
+                temp_freed += size
+        else:
+            temp_freed += size
+    if apply and dropped:
+        # A video that is still on disk must stay in the archive, otherwise the
+        # next sync would download a second copy.
+        for vid in kept_ids:
+            if any(v == vid for v, keep, _ in dupes) and \
+                    os.path.isfile(dict((d[0], d[1]) for d in dupes)[vid]):
+                archive_lines.add("youtube " + vid)
+        with open(archive, "w") as fh:
+            fh.write("\n".join(a for a in archive_lines if a))
+    verb = "removed" if apply else "would remove"
+    if not silent:
+        log("dedupe: %d duplicate copy(s) %s, %d fragment(s) %s, "
+            "%d temp file(s) %s -- %.2f GB %s"
+            % (len(dupes), verb, len(orphans), verb, len(temps), verb,
+               (freed + frag_freed + temp_freed) / 1e9, verb))
+    return dropped
+
+
 def verify_media(cfg, state, silent):
     index = state.setdefault("index", {})
     archive = paths_in_dest(cfg["dest"])["archive"]
@@ -1808,19 +1983,42 @@ def verify_media(cfg, state, silent):
             except OSError:
                 ok = False
         if not ok:
-            _remove_with_sidecars(path)
+            if not _unlink_confirmed(path):
+                # Could not remove it, so do NOT forget the download: keeping
+                # the index entry and archive line is what stops the next run
+                # from fetching a second copy as "Title [ID] 2.mp4".
+                if not silent:
+                    log("could not delete corrupt/unreadable: %s (will retry)"
+                        % os.path.basename(path))
+                continue
             if not silent:
                 log("removed corrupt/unreadable: %s" % os.path.basename(path))
             index.pop(vid, None)
             _discard_archive(archive_lines, vid)
             removed += 1
     added = reconcile_index(cfg, index, state.get("video_cache") or {}, silent)
+    # Anything we hold on disk must be in the download archive, otherwise
+    # yt-dlp treats it as never-downloaded and fetches it again -- which lands
+    # in yt-dlp's numbered variant ("Title [ID] 2.mp4") because the original
+    # filename is still taken. 145 indexed videos had drifted out of the
+    # archive, so this is the net that stops duplicates forming again.
+    rearchived = 0
+    for vid, info in index.items():
+        path = info.get("path")
+        if not path or not os.path.isfile(path):
+            continue
+        if not any(a.split()[-1] == vid for a in archive_lines):
+            archive_lines.add("youtube " + vid)
+            rearchived += 1
+    if rearchived and not silent:
+        log("archive: re-registered %d file(s) already on disk" % rearchived)
     with open(archive, "w") as fh:
         fh.write("\n".join(a for a in archive_lines if a))
     _clean_stale_temp(cfg["dest"], silent=silent)
     if not silent:
         log("verify: checked %d file(s), removed %d broken/missing, "
-            "added %d from disk" % (checked, removed, added))
+            "added %d from disk, re-registered %d in archive"
+            % (checked, removed, added, rearchived))
     return removed
 
 
@@ -2262,7 +2460,8 @@ def main():
                "  yosync --topup          fill hot channels toward budget now\n"
                "  yosync --quickfill      fast fill, heavy parallelism (Ctrl+C to abort)\n"
                "  yosync --serve          open the settings page in your browser\n"
-               "  yosync --verify         integrity-check the library")
+               "  yosync --verify         integrity-check the library\n"
+               "  yosync --dedupe         report duplicate copies and leftovers")
     ap.add_argument("--setup", action="store_true", help="run setup wizard")
     ap.add_argument("--dest", help="offline folder (default ~/Movies/OfflineYouTube)")
     ap.add_argument("--dry-run", action="store_true", help="preview only, no downloads")
@@ -2290,6 +2489,11 @@ def main():
     ap.add_argument("--inbox", action="store_true",
                     help="only process URL files dropped into <library>/inbox/, "
                          "then exit")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="find duplicate copies, interrupted-download fragments "
+                         "and temp files; dry run unless --dedupe-apply")
+    ap.add_argument("--dedupe-apply", action="store_true",
+                    help="actually delete what --dedupe reports")
     args = ap.parse_args()
 
     if args.ingest and (args.daemon or args.no_daemon or args.setup or args.serve):
@@ -2343,6 +2547,18 @@ def main():
             except ValueError:
                 state = {}
         verify_media(cfg, state, args.silent)
+        save_state(p["state"], state)
+        return
+
+    if args.dedupe or args.dedupe_apply:
+        state = {}
+        if os.path.exists(p["state"]):
+            try:
+                with open(p["state"]) as fh:
+                    state = json.load(fh)
+            except ValueError:
+                state = {}
+        dedupe_library(cfg, state, apply=args.dedupe_apply, silent=args.silent)
         save_state(p["state"], state)
         return
 

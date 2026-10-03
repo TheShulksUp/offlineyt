@@ -70,6 +70,14 @@ The library looks like this:
 
 ---
 
+## Housekeeping
+
+| Command | What it does |
+|---|---|
+| `yosync --dry-run` | Preview the sync. Downloads and deletes nothing. |
+| `yosync --verify` | ffprobe every indexed file, drop broken ones, re-sync the download archive with what's actually on disk, clear stale temp files. |
+| `yosync --dedupe` | Report duplicate copies, interrupted-download fragments and leftover temp files. Dry run — pass `--dedupe-apply` to actually delete. |
+
 ## Requirements & download links
 
 | Requirement | Why | Get it |
@@ -186,6 +194,8 @@ python3 ~/bin/yosync --quickfill --logs
 | Flag | What it does |
 |---|---|
 | `--serve` | open the settings page: every knob, live status, help & troubleshooting |
+| `--verify` | integrity-check the library and re-sync the download archive |
+| `--dedupe` / `--dedupe-apply` | report / remove duplicate copies and leftover temp files |
 | `--verify` | integrity-check the library: ffprobe each file, drop broken ones, re-scan disk |
 | `--inbox` | only process URL files you dropped into `<library>/inbox/`, then exit |
 
@@ -331,6 +341,8 @@ yt-dlp -f "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]" \
 | channels never reach budget | they're mostly Shorts or the videos are deleted — nothing left to download |
 | nothing happens when it should | check `logs/sync.log`; `launchctl list \| grep yosync` (macOS) or `systemctl --user list-timers \| grep yosync` (Linux) |
 | a file is corrupt or won't play | `yosync --verify` — ffprobes everything, removes broken files, re-scans disk |
+| two copies of the same video (`Title [ID] 2.mp4`) | `yosync --dedupe` to see them, `--dedupe-apply` to remove the copies |
+| disk filling with leftovers after an interrupted download | `yosync --dedupe` — clears `.part`/`.aria2` temp files and pre-merge fragments |
 | the settings page says the port is in use | close the other tab, or change `settings_port` in the page |
 
 ---
